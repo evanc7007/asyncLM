@@ -1,5 +1,5 @@
 [package]
-name = "evanc/asyncLM"
+name = "async-lm"
 version = "0.1.0"
 description = "An inferlet implementing the logic of AsyncLM"
 
