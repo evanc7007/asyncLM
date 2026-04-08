@@ -7,7 +7,9 @@ use inferlet::context::Context;
 use inferlet::sampler::Sample;
 use inferlet::stop_condition::{ends_with_any, max_len, StopCondition};
 use inferlet::{Args, Result, Sampler, Tokenizer};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 
 // ============================================================================
 // Section 1: CML Token Registry
@@ -17,30 +19,31 @@ use std::collections::{HashMap, HashSet, VecDeque};
 ///
 /// CML tokens may be single special tokens (if registered in the vocabulary)
 /// or multi-token sequences (if the model doesn't have them as specials).
+///
+/// Each CML token is stored as a list of **variant** sequences to handle BPE
+/// context-merging: e.g. `\n[CALL]` often tokenizes as `[498, 24622, 60]` while
+/// `[CALL]` in isolation is `[58, 24622, 60]`.  Both variants are registered so
+/// the parser matches either form.
 struct CmlTokenRegistry {
-    call_ids: Vec<u32>,
-    end_ids: Vec<u32>,
-    intr_ids: Vec<u32>,
-    trap_ids: Vec<u32>,
-    head_ids: Vec<u32>,
+    /// Each entry is one valid token-ID sequence for [CALL] (primary first).
+    call_ids: Vec<Vec<u32>>,
+    end_ids: Vec<Vec<u32>>,
+    intr_ids: Vec<Vec<u32>>,
+    trap_ids: Vec<Vec<u32>>,
+    head_ids: Vec<Vec<u32>>,
 
-    call_str: String,
-    end_str: String,
-    intr_str: String,
-    trap_str: String,
-    head_str: String,
+    /// Combined [TRAP][END] sequences matched atomically.
+    ///
+    /// BPE tokenizers often merge `][` (closing bracket of [TRAP] + opening bracket
+    /// of [END]) into a single token (e.g. 1404 = `][`).  Matching [TRAP][END] as
+    /// a unit handles this without requiring InTrap state.
+    trap_end_ids: Vec<Vec<u32>>,
 
     suppressed_ids: HashSet<u32>,
 }
 
 impl CmlTokenRegistry {
     fn new(tokenizer: &Tokenizer) -> Self {
-        let call_str = "[CALL]".to_string();
-        let end_str = "[END]".to_string();
-        let intr_str = "[INTR]".to_string();
-        let trap_str = "[TRAP]".to_string();
-        let head_str = "[HEAD]".to_string();
-
         // Build a lookup from byte representation to token ID for special tokens
         let (special_ids, special_bytes) = tokenizer.get_special_tokens();
         let special_map: HashMap<Vec<u8>, u32> = special_bytes
@@ -48,58 +51,98 @@ impl CmlTokenRegistry {
             .zip(special_ids.into_iter())
             .collect();
 
-        let call_ids = Self::resolve_token(tokenizer, &special_map, &call_str);
-        let end_ids = Self::resolve_token(tokenizer, &special_map, &end_str);
-        let intr_ids = Self::resolve_token(tokenizer, &special_map, &intr_str);
-        let trap_ids = Self::resolve_token(tokenizer, &special_map, &trap_str);
-        let head_ids = Self::resolve_token(tokenizer, &special_map, &head_str);
+        let call_ids = Self::resolve_variants(tokenizer, &special_map, "[CALL]");
+        let end_ids  = Self::resolve_variants(tokenizer, &special_map, "[END]");
+        let intr_ids = Self::resolve_variants(tokenizer, &special_map, "[INTR]");
+        let trap_ids = Self::resolve_variants(tokenizer, &special_map, "[TRAP]");
+        let head_ids = Self::resolve_variants(tokenizer, &special_map, "[HEAD]");
 
-        // Suppress all token IDs that make up [INTR]
-        let suppressed_ids: HashSet<u32> = intr_ids.iter().copied().collect();
+        // Build combined [TRAP][END] sequences matched atomically.
+        // When `][` is a single BPE token (e.g. 1404), the full sequence becomes
+        // [trap_primary[..-1], merged_bracket, end_primary[1..]] instead of
+        // [trap_primary.., end_primary..].
+        let trap_primary = &trap_ids[0];
+        let end_primary  = &end_ids[0];
+        let trap_end_full: Vec<u32> = trap_primary.iter().chain(end_primary.iter()).cloned().collect();
+        let mut trap_end_ids = vec![trap_end_full];
+        {
+            let bracket_merge = tokenizer.tokenize("][");
+            if bracket_merge.len() == 1 {
+                let merged = bracket_merge[0];
+                // [TRAP_without_close] + [merged_][_bracket] + [END_without_open]
+                let mut merged_seq: Vec<u32> = trap_primary[..trap_primary.len() - 1].to_vec();
+                merged_seq.push(merged);
+                merged_seq.extend_from_slice(&end_primary[1..]);
+                inferlet::send(&format!(
+                    "[AsyncLM] ][ BPE merge detected: token={} trap_end_merged={:?}",
+                    merged, merged_seq
+                ));
+                trap_end_ids.push(merged_seq);
+            }
+        }
 
-        CmlTokenRegistry {
-            call_ids,
-            end_ids,
-            intr_ids,
-            trap_ids,
-            head_ids,
-            call_str,
-            end_str,
-            intr_str,
-            trap_str,
-            head_str,
-            suppressed_ids,
+        // Suppress only the token IDs *unique* to [INTR] primary sequence.
+        // Shared bracket tokens (`[`, `]`) appear in every CML sequence and
+        // must NOT be suppressed — they're needed for other delimiters.
+        let shared_ids: HashSet<u32> = call_ids[0].iter()
+            .chain(end_ids[0].iter())
+            .chain(trap_ids[0].iter())
+            .chain(head_ids[0].iter())
+            .copied()
+            .collect();
+        let suppressed_ids: HashSet<u32> = intr_ids[0].iter()
+            .copied()
+            .filter(|id| !shared_ids.contains(id))
+            .collect();
+
+        CmlTokenRegistry { call_ids, end_ids, intr_ids, trap_ids, head_ids, trap_end_ids, suppressed_ids }
+    }
+
+    /// Resolve a CML token string to ALL valid token-ID sequences.
+    ///
+    /// BPE tokenizers frequently merge a preceding `\n` with `[` into a single
+    /// token (e.g. `\n[CALL]` → `[498, 24622, 60]` vs `[CALL]` → `[58, 24622, 60]`).
+    /// This method detects such merges and adds the merged form as an alternate
+    /// variant so the parser recognises both.
+    fn resolve_variants(
+        tokenizer: &Tokenizer,
+        special_map: &HashMap<Vec<u8>, u32>,
+        text: &str,
+    ) -> Vec<Vec<u32>> {
+        let primary = Self::resolve_primary(tokenizer, special_map, text);
+
+        // Tokenize with a newline prefix to detect \n+[ BPE merging.
+        let with_nl = tokenizer.tokenize(&format!("\n{}", text));
+
+        // Merged form: same length as primary but different first token,
+        // with identical suffix.  This means `\n` collapsed into primary[0].
+        if with_nl.len() == primary.len()
+            && !with_nl.is_empty()
+            && with_nl[0] != primary[0]
+            && with_nl[1..] == primary[1..]
+        {
+            inferlet::send(&format!(
+                "[AsyncLM] BPE merge detected for '{}': bare={:?} nl-merged={:?}",
+                text, primary, with_nl
+            ));
+            vec![primary, with_nl]
+        } else {
+            vec![primary]
         }
     }
 
-    /// Resolves a CML token string to its token ID(s).
-    /// First checks if it exists as a single special token, otherwise falls back to tokenize().
-    fn resolve_token(
+    /// Returns the primary (isolated) token-ID sequence for a CML token string.
+    fn resolve_primary(
         tokenizer: &Tokenizer,
         special_map: &HashMap<Vec<u8>, u32>,
         text: &str,
     ) -> Vec<u32> {
-        // Try special token lookup first
         if let Some(&id) = special_map.get(text.as_bytes()) {
             return vec![id];
         }
-        // Fall back to regular tokenization
         let ids = tokenizer.tokenize(text);
-        assert!(
-            !ids.is_empty(),
-            "CML token '{}' tokenized to empty sequence",
-            text
-        );
+        assert!(!ids.is_empty(), "CML token '{}' tokenized to empty sequence", text);
         ids
-    }
-
-    /// Returns true if all CML tokens resolve to single IDs (ideal fast path).
-    fn all_single_token(&self) -> bool {
-        self.call_ids.len() == 1
-            && self.end_ids.len() == 1
-            && self.intr_ids.len() == 1
-            && self.trap_ids.len() == 1
-            && self.head_ids.len() == 1
     }
 }
 
@@ -130,29 +173,75 @@ enum CmlDelimiter {
     Call,
     End,
     Trap,
+    /// Matched full [TRAP][END] sequence atomically (handles BPE-merged `][` token).
+    TrapEnd,
     Head,
     None,
 }
 
 struct CmlParser {
-    call_ids: Vec<u32>,
-    end_ids: Vec<u32>,
-    trap_ids: Vec<u32>,
-    head_ids: Vec<u32>,
+    /// Full sequences including bracket token — used in Normal state.
+    call_ids: Vec<Vec<u32>>,
+    end_ids: Vec<Vec<u32>>,
+    trap_ids: Vec<Vec<u32>>,
+    head_ids: Vec<Vec<u32>>,
+
+    /// Combined [TRAP][END] sequences matched atomically in Normal state.
+    /// Handles BPE `][` merge (e.g. token 1404 = `][`).
+    trap_end_ids: Vec<Vec<u32>>,
+
+    /// Bracket-free inner suffixes: primary[1..].
+    ///
+    /// BPE tokenizers often merge `\n` + `[` into a single token (e.g. 498 = `\n[`).
+    /// We cannot reliably detect this via offline `tokenize()` probing because the merge
+    /// only applies in context.  Inside InCallId/InCallBody/InTrap we already KNOW we are
+    /// inside a CML block, so the leading bracket is redundant — we match only the
+    /// tag-identifier + closing bracket.  This is unambiguous because these inner tokens
+    /// (e.g. 24622 = `CALL`, 34261 = `HEAD`, 4537 = `END`) are highly model-specific.
+    call_inner: Vec<u32>,
+    head_inner: Vec<u32>,
+    end_inner: Vec<u32>,
+    trap_inner: Vec<u32>,
+
     state: CmlState,
     id_tokens: Vec<u32>,
     body_tokens: Vec<u32>,
-    /// Buffer for matching multi-token CML delimiters in Normal state
     match_buf: Vec<u32>,
 }
 
 impl CmlParser {
     fn new(registry: &CmlTokenRegistry) -> Self {
+        // Primary sequences (index 0 in each variant list)
+        let call_primary = &registry.call_ids[0];
+        let head_primary = &registry.head_ids[0];
+        let end_primary  = &registry.end_ids[0];
+        let trap_primary = &registry.trap_ids[0];
+
+        // Inner suffix = everything after the first (bracket) token
+        let call_inner = call_primary[1..].to_vec();
+        let head_inner = head_primary[1..].to_vec();
+        let end_inner  = end_primary[1..].to_vec();
+        let trap_inner = trap_primary[1..].to_vec();
+
+        inferlet::send(&format!(
+            "[AsyncLM] CML inner: call={:?} head={:?} end={:?} trap={:?}",
+            call_inner, head_inner, end_inner, trap_inner
+        ));
+        inferlet::send(&format!(
+            "[AsyncLM] CML trap_end variants: {:?}",
+            registry.trap_end_ids
+        ));
+
         CmlParser {
             call_ids: registry.call_ids.clone(),
             end_ids: registry.end_ids.clone(),
             trap_ids: registry.trap_ids.clone(),
             head_ids: registry.head_ids.clone(),
+            trap_end_ids: registry.trap_end_ids.clone(),
+            call_inner,
+            head_inner,
+            end_inner,
+            trap_inner,
             state: CmlState::Normal,
             id_tokens: Vec::new(),
             body_tokens: Vec::new(),
@@ -160,37 +249,80 @@ impl CmlParser {
         }
     }
 
-    /// Check if `buf` ends with `pattern`
     fn buf_ends_with(buf: &[u32], pattern: &[u32]) -> bool {
-        buf.len() >= pattern.len() && buf[buf.len() - pattern.len()..] == *pattern
+        !pattern.is_empty()
+            && buf.len() >= pattern.len()
+            && buf[buf.len() - pattern.len()..] == *pattern
     }
 
-    /// Try to match a delimiter at the tail of `buf`. Returns delimiter and its length.
+    /// Match full delimiter sequences (for Normal state — requires leading bracket token).
     fn match_delimiter(&self, buf: &[u32]) -> (CmlDelimiter, usize) {
-        // Check each delimiter — order matters (check longer patterns first if same prefix)
-        if Self::buf_ends_with(buf, &self.call_ids) {
-            return (CmlDelimiter::Call, self.call_ids.len());
+        for seq in &self.call_ids {
+            if Self::buf_ends_with(buf, seq) { return (CmlDelimiter::Call, seq.len()); }
         }
-        if Self::buf_ends_with(buf, &self.end_ids) {
-            return (CmlDelimiter::End, self.end_ids.len());
+        for seq in &self.end_ids {
+            if Self::buf_ends_with(buf, seq) { return (CmlDelimiter::End, seq.len()); }
         }
-        if Self::buf_ends_with(buf, &self.trap_ids) {
-            return (CmlDelimiter::Trap, self.trap_ids.len());
+        // Check combined [TRAP][END] before plain [TRAP] so BPE-merged `][` form wins.
+        for seq in &self.trap_end_ids {
+            if Self::buf_ends_with(buf, seq) { return (CmlDelimiter::TrapEnd, seq.len()); }
         }
-        if Self::buf_ends_with(buf, &self.head_ids) {
-            return (CmlDelimiter::Head, self.head_ids.len());
+        for seq in &self.trap_ids {
+            if Self::buf_ends_with(buf, seq) { return (CmlDelimiter::Trap, seq.len()); }
+        }
+        for seq in &self.head_ids {
+            if Self::buf_ends_with(buf, seq) { return (CmlDelimiter::Head, seq.len()); }
         }
         (CmlDelimiter::None, 0)
     }
 
-    /// Could `buf` be the start of any CML delimiter?
+    /// Match inner (bracket-free) suffixes (for InCallId/InCallBody/InTrap states).
+    fn match_inner_delimiter(&self, buf: &[u32]) -> (CmlDelimiter, usize) {
+        if Self::buf_ends_with(buf, &self.call_inner) { return (CmlDelimiter::Call, self.call_inner.len()); }
+        if Self::buf_ends_with(buf, &self.end_inner)  { return (CmlDelimiter::End,  self.end_inner.len());  }
+        if Self::buf_ends_with(buf, &self.trap_inner) { return (CmlDelimiter::Trap, self.trap_inner.len()); }
+        if Self::buf_ends_with(buf, &self.head_inner) { return (CmlDelimiter::Head, self.head_inner.len()); }
+        (CmlDelimiter::None, 0)
+    }
+
     fn is_prefix_of_any_delimiter(&self, buf: &[u32]) -> bool {
-        for pattern in [&self.call_ids, &self.end_ids, &self.trap_ids, &self.head_ids] {
-            if buf.len() <= pattern.len() && pattern[..buf.len()] == *buf {
+        for variants in [&self.call_ids, &self.end_ids, &self.trap_ids, &self.head_ids] {
+            for seq in variants {
+                if buf.len() <= seq.len() && seq[..buf.len()] == *buf {
+                    return true;
+                }
+            }
+        }
+        // Also check combined [TRAP][END] sequences (handles BPE-merged `][` token).
+        for seq in &self.trap_end_ids {
+            if buf.len() <= seq.len() && seq[..buf.len()] == *buf {
                 return true;
             }
         }
         false
+    }
+
+    fn is_prefix_of_any_inner(&self, buf: &[u32]) -> bool {
+        for pattern in [&self.call_inner, &self.end_inner, &self.trap_inner, &self.head_inner] {
+            if !pattern.is_empty() && buf.len() <= pattern.len() && pattern[..buf.len()] == *buf {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Strip a trailing bracket token (`[` or `\n[`) from a token list.
+    /// Called after matching a delimiter via its inner suffix so the bracket
+    /// that was flushed to id/body tokens is removed.
+    fn strip_trailing_bracket(tokens: &mut Vec<u32>, tokenizer: &Tokenizer) {
+        if let Some(&last) = tokens.last() {
+            let decoded = tokenizer.detokenize(&[last]);
+            // Strip any token whose decoded form ends with `[`.
+            // This covers bare `[` (58), `\n[` (498), ` [`, `Ċ[`, etc.
+            if decoded.ends_with('[') {
+                tokens.pop();
+            }
+        }
     }
 
     fn feed(&mut self, token_id: u32, tokenizer: &Tokenizer) -> Vec<CmlEvent> {
@@ -204,39 +336,44 @@ impl CmlParser {
                 let (delim, delim_len) = self.match_delimiter(&self.match_buf);
                 match delim {
                     CmlDelimiter::Call => {
-                        // Flush any tokens before the delimiter as passthrough
                         let passthrough_end = self.match_buf.len() - delim_len;
                         for i in 0..passthrough_end {
-                            events.push(CmlEvent::PassthroughToken {
-                                token_id: self.match_buf[i],
-                            });
+                            events.push(CmlEvent::PassthroughToken { token_id: self.match_buf[i] });
                         }
                         self.match_buf.clear();
                         events.push(CmlEvent::EnterCriticalSection);
                         self.id_tokens.clear();
                         self.body_tokens.clear();
                         self.state = CmlState::InCallId;
-                        inferlet::send(&format!("[Parser] MATCHED {:?}, transitioning to {:?}", delim, self.state));
+                        inferlet::send("[Parser] MATCHED Call → InCallId");
                     }
                     CmlDelimiter::Trap => {
                         let passthrough_end = self.match_buf.len() - delim_len;
                         for i in 0..passthrough_end {
-                            events.push(CmlEvent::PassthroughToken {
-                                token_id: self.match_buf[i],
-                            });
+                            events.push(CmlEvent::PassthroughToken { token_id: self.match_buf[i] });
                         }
                         self.match_buf.clear();
                         events.push(CmlEvent::EnterCriticalSection);
                         self.state = CmlState::InTrap;
+                        inferlet::send("[Parser] MATCHED Trap → InTrap");
+                    }
+                    CmlDelimiter::TrapEnd => {
+                        // Full [TRAP][END] matched atomically — no InTrap state needed.
+                        // This handles the BPE-merged `][` token case.
+                        let passthrough_end = self.match_buf.len() - delim_len;
+                        for i in 0..passthrough_end {
+                            events.push(CmlEvent::PassthroughToken { token_id: self.match_buf[i] });
+                        }
+                        self.match_buf.clear();
+                        events.push(CmlEvent::EnterCriticalSection);
+                        events.push(CmlEvent::TrapDetected);
+                        events.push(CmlEvent::ExitCriticalSection);
+                        inferlet::send("[Parser] MATCHED TrapEnd → TrapDetected (atomic)");
                     }
                     CmlDelimiter::None => {
-                        // Check if buffer could still be a prefix of a delimiter
                         if !self.is_prefix_of_any_delimiter(&self.match_buf) {
-                            // Flush the first token as passthrough, keep the rest
-                            // (they might form a prefix with future tokens)
                             let first = self.match_buf.remove(0);
                             events.push(CmlEvent::PassthroughToken { token_id: first });
-                            // Keep draining non-prefix tokens
                             while !self.match_buf.is_empty()
                                 && !self.is_prefix_of_any_delimiter(&self.match_buf)
                             {
@@ -246,7 +383,6 @@ impl CmlParser {
                         }
                     }
                     _ => {
-                        // End/Head in Normal state: treat as passthrough
                         for &t in &self.match_buf {
                             events.push(CmlEvent::PassthroughToken { token_id: t });
                         }
@@ -254,44 +390,50 @@ impl CmlParser {
                     }
                 }
             }
+
             CmlState::InCallId => {
                 self.match_buf.push(token_id);
-                let (delim, delim_len) = self.match_delimiter(&self.match_buf);
+
+                // Try full-sequence match first, then inner (bracket-free) match.
+                let (delim, delim_len) = {
+                    let (d, l) = self.match_delimiter(&self.match_buf);
+                    if d != CmlDelimiter::None { (d, l) } else { self.match_inner_delimiter(&self.match_buf) }
+                };
+
                 match delim {
                     CmlDelimiter::Head => {
-                        // Tokens before [HEAD] are part of the call id
                         let id_end = self.match_buf.len() - delim_len;
                         self.id_tokens.extend_from_slice(&self.match_buf[..id_end]);
                         self.match_buf.clear();
+                        // Strip trailing bracket token that may have been flushed to id_tokens
+                        // before the inner HEAD suffix was recognised.
+                        Self::strip_trailing_bracket(&mut self.id_tokens, tokenizer);
                         self.state = CmlState::InCallBody;
+                        inferlet::send("[Parser] MATCHED Head → InCallBody");
                     }
                     CmlDelimiter::End => {
-                        // Call with no body: [CALL] id [END]
                         let id_end = self.match_buf.len() - delim_len;
                         self.id_tokens.extend_from_slice(&self.match_buf[..id_end]);
                         self.match_buf.clear();
-                        let id = tokenizer.detokenize(&self.id_tokens);
-                        let id = id.trim().to_string();
-                        events.push(CmlEvent::CallDetected {
-                            id,
-                            code: String::new(),
-                        });
+                        Self::strip_trailing_bracket(&mut self.id_tokens, tokenizer);
+                        let id = tokenizer.detokenize(&self.id_tokens).trim().to_string();
+                        inferlet::send(&format!("[Parser] EVENT: CallDetected id={} (no body)", id));
+                        events.push(CmlEvent::CallDetected { id, code: String::new() });
                         events.push(CmlEvent::ExitCriticalSection);
                         self.id_tokens.clear();
                         self.state = CmlState::Normal;
                     }
                     CmlDelimiter::Call => {
-                        // Nested [CALL] — reset, warn
-                        inferlet::send(
-                            "[AsyncLM] Warning: nested [CALL] detected, resetting parser",
-                        );
+                        // Nested/restarted [CALL] — reset and stay in InCallId
+                        inferlet::send("[AsyncLM] Warning: nested [CALL], resetting");
                         self.match_buf.clear();
                         self.id_tokens.clear();
                         self.body_tokens.clear();
                     }
                     CmlDelimiter::None => {
-                        // If not a prefix of any delimiter, flush to id_tokens
-                        if !self.is_prefix_of_any_delimiter(&self.match_buf) {
+                        let is_prefix = self.is_prefix_of_any_delimiter(&self.match_buf)
+                            || self.is_prefix_of_any_inner(&self.match_buf);
+                        if !is_prefix {
                             self.id_tokens.extend_from_slice(&self.match_buf);
                             self.match_buf.clear();
                         }
@@ -299,18 +441,24 @@ impl CmlParser {
                     _ => {} // Trap in InCallId: ignore
                 }
             }
+
             CmlState::InCallBody => {
                 self.match_buf.push(token_id);
-                let (delim, delim_len) = self.match_delimiter(&self.match_buf);
+
+                let (delim, delim_len) = {
+                    let (d, l) = self.match_delimiter(&self.match_buf);
+                    if d != CmlDelimiter::None { (d, l) } else { self.match_inner_delimiter(&self.match_buf) }
+                };
+
                 match delim {
                     CmlDelimiter::End => {
                         let body_end = self.match_buf.len() - delim_len;
                         self.body_tokens.extend_from_slice(&self.match_buf[..body_end]);
                         self.match_buf.clear();
-                        let id = tokenizer.detokenize(&self.id_tokens);
-                        let id = id.trim().to_string();
-                        let code = tokenizer.detokenize(&self.body_tokens);
-                        let code = code.trim().to_string();
+                        // Strip trailing bracket that preceded the inner END suffix
+                        Self::strip_trailing_bracket(&mut self.body_tokens, tokenizer);
+                        let id   = tokenizer.detokenize(&self.id_tokens).trim().to_string();
+                        let code = tokenizer.detokenize(&self.body_tokens).trim().to_string();
                         inferlet::send(&format!("[Parser] EVENT: CallDetected id={} code={}", id, code));
                         events.push(CmlEvent::CallDetected { id, code });
                         events.push(CmlEvent::ExitCriticalSection);
@@ -319,7 +467,9 @@ impl CmlParser {
                         self.state = CmlState::Normal;
                     }
                     CmlDelimiter::None => {
-                        if !self.is_prefix_of_any_delimiter(&self.match_buf) {
+                        let is_prefix = self.is_prefix_of_any_delimiter(&self.match_buf)
+                            || self.is_prefix_of_any_inner(&self.match_buf);
+                        if !is_prefix {
                             self.body_tokens.extend_from_slice(&self.match_buf);
                             self.match_buf.clear();
                         }
@@ -327,22 +477,31 @@ impl CmlParser {
                     _ => {} // Other delimiters in body: accumulate
                 }
             }
+
             CmlState::InTrap => {
                 self.match_buf.push(token_id);
-                let (delim, _) = self.match_delimiter(&self.match_buf);
+
+                let (delim, _) = {
+                    let (d, l) = self.match_delimiter(&self.match_buf);
+                    if d != CmlDelimiter::None { (d, l) } else { self.match_inner_delimiter(&self.match_buf) }
+                };
+
                 match delim {
                     CmlDelimiter::End => {
                         self.match_buf.clear();
+                        inferlet::send("[Parser] EVENT: TrapDetected");
                         events.push(CmlEvent::TrapDetected);
                         events.push(CmlEvent::ExitCriticalSection);
                         self.state = CmlState::Normal;
                     }
                     CmlDelimiter::None => {
-                        if !self.is_prefix_of_any_delimiter(&self.match_buf) {
+                        let is_prefix = self.is_prefix_of_any_delimiter(&self.match_buf)
+                            || self.is_prefix_of_any_inner(&self.match_buf);
+                        if !is_prefix {
                             self.match_buf.clear(); // Discard non-delimiter tokens in trap
                         }
                     }
-                    _ => {} // Other delimiters in trap: ignore
+                    _ => {}
                 }
             }
         }
@@ -354,10 +513,18 @@ impl CmlParser {
         self.state != CmlState::Normal
     }
 
-    /// Returns true if `token_id` is the first token of a [CALL] or [TRAP] delimiter.
+    /// Returns true if `token_id` is the first token of a [CALL] or [TRAP] sequence
+    /// (either the leading bracket form or the inner-suffix form).
     /// Used to save a checkpoint *before* the delimiter enters the context.
     fn is_entry_delimiter_start(&self, token_id: u32) -> bool {
-        self.call_ids.first() == Some(&token_id) || self.trap_ids.first() == Some(&token_id)
+        // Full-sequence first tokens (e.g. 58 = `[`)
+        self.call_ids.iter().any(|seq| seq.first() == Some(&token_id))
+            || self.trap_ids.iter().any(|seq| seq.first() == Some(&token_id))
+            // Inner-suffix first tokens (e.g. 24622 = `CALL`, 2301 = `TRAP`)
+            // These fire when the bracket merged with a preceding newline and the
+            // offline tokenizer missed the BPE merge.
+            || self.call_inner.first() == Some(&token_id)
+            || self.trap_inner.first() == Some(&token_id)
     }
 
     /// Returns true if the match buffer has pending tokens (potential partial delimiter)
@@ -380,41 +547,66 @@ impl CmlParser {
 // Section 3: Anti-Hallucination Sampler
 // ============================================================================
 
-/// Custom sampler that suppresses `[INTR]` tokens so the LLM can never
-/// generate them — only the system can inject interrupts.
+/// Custom sampler that suppresses `[INTR]` tokens and applies repetition penalty.
+///
+/// `recent_tokens` is shared with the coordinator via `Rc<RefCell<...>>` — safe in
+/// single-threaded WASM.  The coordinator pushes each sampled token after every
+/// `decode_step`; this sampler reads it to downweight already-seen tokens.
 struct AsyncLmSampler {
     suppressed_ids: HashSet<u32>,
     top_p: f32,
+    /// Multiplicative penalty applied to recently seen tokens (>1.0 reduces their prob).
+    repetition_penalty: f32,
+    /// Sliding window of recently generated token IDs, shared with the coordinator.
+    recent_tokens: Rc<RefCell<VecDeque<u32>>>,
 }
 
 impl AsyncLmSampler {
-    fn new(suppressed_ids: HashSet<u32>, top_p: f32) -> Self {
+    fn new(
+        suppressed_ids: HashSet<u32>,
+        top_p: f32,
+        repetition_penalty: f32,
+        recent_tokens: Rc<RefCell<VecDeque<u32>>>,
+    ) -> Self {
         AsyncLmSampler {
             suppressed_ids,
             top_p,
+            repetition_penalty,
+            recent_tokens,
         }
     }
 }
 
 impl Sample for AsyncLmSampler {
     fn sample(&self, ids: &[u32], probs: &[f32]) -> u32 {
-        // Filter out suppressed IDs and collect valid (id, prob) pairs
+        let recent = self.recent_tokens.borrow();
+
+        // Filter suppressed, apply repetition penalty, collect candidates
         let mut candidates: Vec<(u32, f32)> = ids
             .iter()
             .zip(probs.iter())
             .filter(|(id, _)| !self.suppressed_ids.contains(id))
-            .map(|(id, p)| (*id, *p))
+            .map(|(id, p)| {
+                let penalized = if self.repetition_penalty > 1.0 && recent.contains(id) {
+                    // Divide prob by penalty (never below a tiny epsilon)
+                    (*p / self.repetition_penalty).max(1e-9)
+                } else {
+                    *p
+                };
+                (*id, penalized)
+            })
             .collect();
 
+        drop(recent); // release borrow before any further work
+
         if candidates.is_empty() {
-            // Fallback: if all tokens are suppressed, return the most probable original
             return ids[0];
         }
 
-        // Sort by probability descending
+        // Sort by (penalized) probability descending
         candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Apply top-p (nucleus) filtering
+        // Apply top-p (nucleus) filtering on the penalized distribution
         let total: f32 = candidates.iter().map(|(_, p)| p).sum();
         let mut cumulative = 0.0f32;
         let mut cutoff = candidates.len();
@@ -427,16 +619,10 @@ impl Sample for AsyncLmSampler {
         }
         candidates.truncate(cutoff);
 
-        // Renormalize and sample
-        let norm: f32 = candidates.iter().map(|(_, p)| p).sum();
-        if norm <= 0.0 {
-            return candidates[0].0;
-        }
-
-        // Simple weighted random using a deterministic approach:
-        // pick proportionally — use the probability distribution directly
-        // Since we don't have a RNG in WASM, we pick the highest probability token
-        // after top-p filtering. The temperature is handled by the Sampler::Custom wrapper.
+        // Pick the highest probability token after filtering.
+        // Temperature scaling is applied by the Sampler::Custom wrapper before
+        // this method is called; without an RNG in WASM we use greedy selection
+        // from the filtered nucleus.
         candidates[0].0
     }
 }
@@ -531,27 +717,14 @@ struct InterruptManager {
     pending: VecDeque<ExecutionResult>,
     injected_ids: HashSet<String>,
     in_critical_section: bool,
-    registry: CmlTokenRegistryRef,
-}
-
-/// Lightweight reference to the CML string forms needed for formatting.
-struct CmlTokenRegistryRef {
-    intr_str: String,
-    head_str: String,
-    end_str: String,
 }
 
 impl InterruptManager {
-    fn new(registry: &CmlTokenRegistry) -> Self {
+    fn new(_registry: &CmlTokenRegistry) -> Self {
         InterruptManager {
             pending: VecDeque::new(),
             injected_ids: HashSet::new(),
             in_critical_section: false,
-            registry: CmlTokenRegistryRef {
-                intr_str: registry.intr_str.clone(),
-                head_str: registry.head_str.clone(),
-                end_str: registry.end_str.clone(),
-            },
         }
     }
 
@@ -576,14 +749,7 @@ impl InterruptManager {
             } else {
                 result.output.clone()
             };
-            let formatted = format!(
-                "{} {} {} {} {}",
-                self.registry.intr_str,
-                result.id,
-                self.registry.head_str,
-                output,
-                self.registry.end_str
-            );
+            let formatted = format!("[INTR] {} [HEAD] {} [END]", result.id, output);
             self.injected_ids.insert(result.id);
             injections.push(formatted);
         }
@@ -726,10 +892,19 @@ struct AsyncLmCoordinator {
     checkpoint_mgr: CheckpointManager,
     trap_handler: TrapHandler,
     tokenizer: Tokenizer,
+    /// Sliding window of recently generated token IDs, shared with the sampler.
+    recent_tokens: Rc<RefCell<VecDeque<u32>>>,
+    /// Maximum number of tokens to keep in the repetition window.
+    repetition_window: usize,
 }
 
 impl AsyncLmCoordinator {
-    fn new(registry: &CmlTokenRegistry, tokenizer: Tokenizer, trap_config: TrapConfig) -> Self {
+    fn new(
+        registry: &CmlTokenRegistry,
+        tokenizer: Tokenizer,
+        trap_config: TrapConfig,
+        recent_tokens: Rc<RefCell<VecDeque<u32>>>,
+    ) -> Self {
         AsyncLmCoordinator {
             parser: CmlParser::new(registry),
             executor: MessageExecutor::new(),
@@ -737,6 +912,8 @@ impl AsyncLmCoordinator {
             checkpoint_mgr: CheckpointManager::new(),
             trap_handler: TrapHandler::new(trap_config),
             tokenizer,
+            recent_tokens,
+            repetition_window: 64,
         }
     }
 
@@ -752,6 +929,15 @@ impl AsyncLmCoordinator {
 
         loop {
             let token_id = ctx.decode_step(sampler).await;
+
+            // Update repetition penalty window
+            {
+                let mut rt = self.recent_tokens.borrow_mut();
+                rt.push_back(token_id);
+                if rt.len() > self.repetition_window {
+                    rt.pop_front();
+                }
+            }
 
             // Save checkpoint before the delimiter enters the context so that Swap/Recompute
             // restore to a clean state (no partial CML block in pending).
@@ -933,11 +1119,14 @@ async fn main(mut args: Args) -> Result<String> {
             [CALL] weather2 [HEAD] get_weather(\"London\") [END]
             [TRAP][END]
 
-            Always use this exact format. Never omit the delimiters."
+            Always use this exact format. Never omit the delimiters. Assume you have a function called get_weather()."
                 .to_string()
         });
     let temperature: f32 = args.value_from_str(["-t", "--temperature"]).unwrap_or(0.6);
     let top_p: f32 = args.value_from_str("--top-p").unwrap_or(0.95);
+    let repetition_penalty: f32 = args
+        .value_from_str("--repetition-penalty")
+        .unwrap_or(1.3);
     let max_context: usize = args
         .value_from_str("--max-context")
         .unwrap_or(4096);
@@ -948,10 +1137,21 @@ async fn main(mut args: Args) -> Result<String> {
     // Build CML token registry
     let registry = CmlTokenRegistry::new(&tokenizer);
     inferlet::send(&format!("[AsyncLM] CML tokens: call={:?} end={:?} head={:?} trap={:?} intr={:?}",
-    registry.call_ids, registry.end_ids, registry.head_ids, registry.trap_ids, registry.intr_ids));
+        registry.call_ids[0], registry.end_ids[0], registry.head_ids[0],
+        registry.trap_ids[0], registry.intr_ids[0]));
+    inferlet::send(&format!("[AsyncLM] repetition_penalty={} temperature={} top_p={}",
+        repetition_penalty, temperature, top_p));
 
-    // Create custom sampler that suppresses [INTR]
-    let async_sampler = AsyncLmSampler::new(registry.suppressed_ids.clone(), top_p);
+    // Shared token history for repetition penalty (Rc: safe in single-threaded WASM)
+    let recent_tokens: Rc<RefCell<VecDeque<u32>>> = Rc::new(RefCell::new(VecDeque::new()));
+
+    // Create custom sampler that suppresses [INTR] and applies repetition penalty
+    let async_sampler = AsyncLmSampler::new(
+        registry.suppressed_ids.clone(),
+        top_p,
+        repetition_penalty,
+        Rc::clone(&recent_tokens),
+    );
     let sampler = Sampler::Custom {
         temperature,
         sampler: Box::new(async_sampler),
@@ -964,7 +1164,7 @@ async fn main(mut args: Args) -> Result<String> {
     };
 
     // Create coordinator
-    let mut coordinator = AsyncLmCoordinator::new(&registry, tokenizer, trap_config);
+    let mut coordinator = AsyncLmCoordinator::new(&registry, tokenizer, trap_config, recent_tokens);
 
     // Prepare context
     let mut ctx = model.create_context();
