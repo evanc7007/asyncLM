@@ -562,6 +562,12 @@ async fn main(mut args: Args) -> Result<String> {
              - [TRAP][END] pauses generation until every pending [CALL] has\n\
                returned an [INTR]. Only emit [TRAP][END] when you actually need\n\
                a result to decide what to do next.\n\
+             - BETWEEN your [CALL] dispatches and the [TRAP][END], write any\n\
+               reasoning or prose that does NOT depend on the call results.\n\
+               This is the whole point of async: the calls run in parallel\n\
+               with your writing, so prose before [TRAP] is free latency-wise.\n\
+               Delay [TRAP][END] as long as you still have result-independent\n\
+               things to say.\n\
              - After [INTR] frames appear you may EITHER (a) dispatch another\n\
                round of [CALL]s whose inputs depend on those results, then\n\
                [TRAP][END] again, OR (b) write the final natural-language answer\n\
@@ -598,7 +604,26 @@ async fn main(mut args: Args) -> Result<String> {
              Assistant: [CALL] p1 [HEAD] get_weather(\"Paris\") [END]\n\
              [TRAP][END]\n\
              [INTR] p1 [HEAD] {\"temp_f\": 59, \"sky\": \"rainy\"} [END]\n\
-             Paris is 59°F and rainy. The capital of Japan is Tokyo."
+             Paris is 59°F and rainy. The capital of Japan is Tokyo.\n\
+             \n\
+             Example 4 — interleaved prose hides call latency (preferred style\n\
+             whenever you have anything to say that does not depend on the\n\
+             results). Note how reasoning appears BEFORE [TRAP][END]:\n\
+             User: Get the weather in Paris and the time in Tokyo, then tell\n\
+             me if it's a reasonable hour to video-call Tokyo from Paris.\n\
+             Assistant: [CALL] w1 [HEAD] get_weather(\"Paris\") [END]\n\
+             [CALL] t1 [HEAD] get_time(\"Asia/Tokyo\") [END]\n\
+             Both calls are dispatched in parallel. While they run, here is the\n\
+             shape of the answer: Paris weather tells us whether the caller is\n\
+             likely indoors and free, and Tokyo local time tells us whether the\n\
+             other side is awake — Tokyo is roughly 7-8 hours ahead of Paris,\n\
+             so a Paris afternoon maps to a Tokyo late-night which is bad, but\n\
+             a Paris morning maps to a Tokyo afternoon which is ideal.\n\
+             [TRAP][END]\n\
+             [INTR] w1 [HEAD] {\"temp_f\": 62, \"sky\": \"overcast\"} [END]\n\
+             [INTR] t1 [HEAD] {\"time\": \"07:30\", \"tz\": \"Asia/Tokyo\"} [END]\n\
+             Paris is 62°F and overcast — comfortable indoor conditions. Tokyo\n\
+             is 07:30, just starting the workday, so this is a good window."
                 .to_string()
         });
     let temperature: f32 = args.value_from_str(["-t", "--temperature"]).unwrap_or(0.6);
