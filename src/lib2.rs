@@ -111,11 +111,14 @@ struct Parser {
     trap_end_ids: Vec<Vec<u32>>,
     // Bracket-free inner suffixes — used inside CML blocks, since the `\n+[`
     // BPE merge makes the leading bracket unpredictable once we're already in
-    // a critical section.
+    // a critical section.  Also consulted in Normal state so we catch [CALL] /
+    // [TRAP] / [TRAP][END] when the leading `[` has been absorbed into the
+    // previous token (e.g. ` [` or `\n[` merged into one BPE piece).
     call_inner: Vec<u32>,
     end_inner: Vec<u32>,
     head_inner: Vec<u32>,
     trap_inner: Vec<u32>,
+    trap_end_inner: Vec<Vec<u32>>,
 
     state: State,
     id_tokens: Vec<u32>,
@@ -130,6 +133,7 @@ impl Parser {
             end_inner:  reg.end_ids[1..].to_vec(),
             head_inner: reg.head_ids[1..].to_vec(),
             trap_inner: reg.trap_ids[1..].to_vec(),
+            trap_end_inner: reg.trap_end_ids.iter().map(|s| s[1..].to_vec()).collect(),
             call_ids: reg.call_ids.clone(),
             end_ids:  reg.end_ids.clone(),
             head_ids: reg.head_ids.clone(),
@@ -169,6 +173,21 @@ impl Parser {
         (Delim::None, 0)
     }
 
+    /// Like `match_inner` but restricted to the delimiters that can appear at
+    /// the top level (Normal state): [CALL], [TRAP], [TRAP][END].  End and
+    /// Head alone have no meaning in Normal state.  Checked after `match_full`
+    /// fails to catch the case where the leading `[` of the delimiter has been
+    /// BPE-merged into the previous token.
+    fn match_normal_inner(&self, buf: &[u32]) -> (Delim, usize) {
+        // TrapEnd first — longest match wins.
+        for s in &self.trap_end_inner {
+            if Self::ends_with(buf, s) { return (Delim::TrapEnd, s.len()); }
+        }
+        if Self::ends_with(buf, &self.call_inner) { return (Delim::Call, self.call_inner.len()); }
+        if Self::ends_with(buf, &self.trap_inner) { return (Delim::Trap, self.trap_inner.len()); }
+        (Delim::None, 0)
+    }
+
     fn is_prefix_of_any(&self, buf: &[u32]) -> bool {
         Self::is_prefix(buf, &self.call_ids)
             || Self::is_prefix(buf, &self.end_ids)
@@ -179,6 +198,7 @@ impl Parser {
             || Self::is_prefix(buf, &self.end_inner)
             || Self::is_prefix(buf, &self.trap_inner)
             || Self::is_prefix(buf, &self.head_inner)
+            || self.trap_end_inner.iter().any(|s| Self::is_prefix(buf, s))
     }
 
     fn strip_trailing_bracket(tokens: &mut Vec<u32>, tokenizer: &Tokenizer) {
@@ -195,11 +215,21 @@ impl Parser {
         match self.state {
             State::Normal => {
                 self.buf.push(token_id);
-                let (d, dlen) = self.match_full(&self.buf);
+                // Try full match (leading `[` present as token 58) first; fall
+                // back to bracket-free inner match to catch BPE-merged leading
+                // brackets like ` [` or `\n[`.
+                let (d, dlen) = {
+                    let (d, l) = self.match_full(&self.buf);
+                    if d != Delim::None { (d, l) } else { self.match_normal_inner(&self.buf) }
+                };
                 match d {
                     Delim::Call => {
                         let end = self.buf.len() - dlen;
-                        for i in 0..end { events.push(Event::Passthrough(self.buf[i])); }
+                        let mut prefix: Vec<u32> = self.buf[..end].to_vec();
+                        // If we matched inner, the last prefix token is the
+                        // bracket-absorbed BPE piece — strip it.
+                        Self::strip_trailing_bracket(&mut prefix, tokenizer);
+                        for t in prefix { events.push(Event::Passthrough(t)); }
                         self.buf.clear();
                         self.id_tokens.clear();
                         self.body_tokens.clear();
@@ -207,24 +237,43 @@ impl Parser {
                     }
                     Delim::Trap => {
                         let end = self.buf.len() - dlen;
-                        for i in 0..end { events.push(Event::Passthrough(self.buf[i])); }
+                        let mut prefix: Vec<u32> = self.buf[..end].to_vec();
+                        Self::strip_trailing_bracket(&mut prefix, tokenizer);
+                        for t in prefix { events.push(Event::Passthrough(t)); }
                         self.buf.clear();
                         self.state = State::InTrap;
                     }
                     Delim::TrapEnd => {
                         let end = self.buf.len() - dlen;
-                        for i in 0..end { events.push(Event::Passthrough(self.buf[i])); }
+                        let mut prefix: Vec<u32> = self.buf[..end].to_vec();
+                        Self::strip_trailing_bracket(&mut prefix, tokenizer);
+                        for t in prefix { events.push(Event::Passthrough(t)); }
                         self.buf.clear();
                         events.push(Event::Trap);
                     }
                     Delim::None => {
                         while !self.buf.is_empty() && !self.is_prefix_of_any(&self.buf) {
                             let t = self.buf.remove(0);
+                            // A token that decodes ending with `[` was buffered
+                            // as a possible CML delimiter start but no delimiter
+                            // formed — it's an aborted attempt (typically from
+                            // [INTR] suppression).  Drop it instead of leaking
+                            // a stray `[` into the passthrough stream.  Real
+                            // delimiters are consumed by matching, not by this
+                            // drain path, so this only catches leakage.
+                            if tokenizer.detokenize(&[t]).ends_with('[') {
+                                continue;
+                            }
                             events.push(Event::Passthrough(t));
                         }
                     }
                     _ => {
-                        for &t in &self.buf { events.push(Event::Passthrough(t)); }
+                        for &t in &self.buf {
+                            if tokenizer.detokenize(&[t]).ends_with('[') {
+                                continue;
+                            }
+                            events.push(Event::Passthrough(t));
+                        }
                         self.buf.clear();
                     }
                 }
@@ -313,9 +362,12 @@ impl Parser {
         events
     }
 
-    fn flush(&mut self) -> Vec<Event> {
-        let out: Vec<Event> = self.buf.drain(..).map(Event::Passthrough).collect();
-        out
+    fn flush(&mut self, tokenizer: &Tokenizer) -> Vec<Event> {
+        self.buf
+            .drain(..)
+            .filter(|&t| !tokenizer.detokenize(&[t]).ends_with('['))
+            .map(Event::Passthrough)
+            .collect()
     }
 }
 
@@ -351,16 +403,129 @@ impl Sample for SuppressingSampler {
 }
 
 // ============================================================================
-// Dummy executor — canned results, immediate.
+// Async dummy executor
+//
+// `execute_call` is an `async fn` that yields `Poll::Pending` until a wall-clock
+// deadline passes, then returns a canned result.  We manually poll these futures
+// once per main-loop iteration with a no-op waker, so calls make progress
+// between `decode_step` awaits — i.e. while the model is generating tokens.
+// This is the key async-LM property: dispatched tool calls run concurrently with
+// token generation and only block at `[TRAP][END]`.
 // ============================================================================
 
-fn execute_call(id: &str, code: &str) -> String {
-    inferlet::send(&format!("[MinAsync] dispatching call id={} code={}", id, code));
-    // Canned response: echo the code with a stub answer.
-    if code.to_lowercase().contains("weather") {
-        format!("{{\"temp_f\": 72, \"sky\": \"sunny\"}}")
+fn noop_waker() -> Waker {
+    const VTABLE: RawWakerVTable =
+        RawWakerVTable::new(|_| RawWaker::new(std::ptr::null(), &VTABLE), |_| {}, |_| {}, |_| {});
+    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+}
+
+async fn execute_call(id: String, code: String, wait_ms: u64) -> String {
+    let deadline = Instant::now() + Duration::from_millis(wait_ms);
+    poll_fn(|cx| {
+        if Instant::now() >= deadline {
+            Poll::Ready(())
+        } else {
+            // Ask to be re-polled — our top-level loop polls us each iteration anyway,
+            // but this keeps things correct under any scheduler.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
+
+    inferlet::send(&format!("[MinAsync] call id={} completed (wait {}ms)", id, wait_ms));
+    let lc = code.to_lowercase();
+
+    // get_weather(city) — standalone or chainable (temp becomes input to another tool)
+    if lc.contains("get_weather") || lc.contains("weather(") {
+        if lc.contains("london") {
+            "{\"temp_f\": 60, \"sky\": \"cloudy\"}".to_string()
+        } else if lc.contains("paris") {
+            "{\"temp_f\": 59, \"sky\": \"rainy\"}".to_string()
+        } else if lc.contains("boston") {
+            "{\"temp_f\": 68, \"sky\": \"clear\"}".to_string()
+        } else if lc.contains("tokyo") {
+            "{\"temp_f\": 75, \"sky\": \"humid\"}".to_string()
+        } else {
+            "{\"temp_f\": 72, \"sky\": \"sunny\"}".to_string()
+        }
+    }
+    // get_stock_price(ticker) — standalone; chainable via convert_currency
+    else if lc.contains("stock_price") || lc.contains("get_stock") {
+        if lc.contains("aapl") {
+            "{\"ticker\": \"AAPL\", \"price_usd\": 189.50}".to_string()
+        } else if lc.contains("goog") {
+            "{\"ticker\": \"GOOG\", \"price_usd\": 141.20}".to_string()
+        } else if lc.contains("tsla") {
+            "{\"ticker\": \"TSLA\", \"price_usd\": 258.30}".to_string()
+        } else {
+            "{\"ticker\": \"UNKNOWN\", \"price_usd\": 100.00}".to_string()
+        }
+    }
+    // convert_currency(amount, from, to) — chains off stock / weather-temp
+    else if lc.contains("convert_currency") || lc.contains("exchange_rate") {
+        if lc.contains("eur") {
+            "{\"rate\": 0.92, \"quote\": \"USD->EUR\"}".to_string()
+        } else if lc.contains("jpy") {
+            "{\"rate\": 155.40, \"quote\": \"USD->JPY\"}".to_string()
+        } else if lc.contains("gbp") {
+            "{\"rate\": 0.79, \"quote\": \"USD->GBP\"}".to_string()
+        } else {
+            "{\"rate\": 1.00, \"quote\": \"USD->USD\"}".to_string()
+        }
+    }
+    // search_restaurants(city) — standalone; chainable via get_reviews
+    else if lc.contains("search_restaurants") || lc.contains("find_restaurants") {
+        if lc.contains("tokyo") {
+            "[\"Sukiyabashi Jiro\", \"Ichiran\", \"Sushi Saito\"]".to_string()
+        } else if lc.contains("paris") {
+            "[\"Le Jules Verne\", \"L'Ami Jean\", \"Septime\"]".to_string()
+        } else {
+            "[\"Katz's Deli\", \"Joe's Pizza\", \"Lombardi's\"]".to_string()
+        }
+    }
+    // get_reviews(name) — chains off search_restaurants
+    else if lc.contains("get_reviews") || lc.contains("reviews(") {
+        if lc.contains("katz") {
+            "{\"stars\": 4.6, \"summary\": \"Iconic pastrami sandwiches\"}".to_string()
+        } else if lc.contains("jiro") {
+            "{\"stars\": 4.9, \"summary\": \"Legendary omakase, tiny counter\"}".to_string()
+        } else if lc.contains("joe") {
+            "{\"stars\": 4.4, \"summary\": \"Classic NY slice, cheap and fast\"}".to_string()
+        } else {
+            "{\"stars\": 4.0, \"summary\": \"Solid, well-reviewed spot\"}".to_string()
+        }
+    }
+    // get_time(timezone) — standalone
+    else if lc.contains("get_time") || lc.contains("time_in") || lc.contains("current_time") {
+        if lc.contains("tokyo") || lc.contains("jst") {
+            "{\"time\": \"2026-04-21T23:32+09:00\", \"tz\": \"JST\"}".to_string()
+        } else if lc.contains("london") || lc.contains("gmt") {
+            "{\"time\": \"2026-04-21T15:32+01:00\", \"tz\": \"BST\"}".to_string()
+        } else if lc.contains("new_york") || lc.contains("nyc") || lc.contains("est") {
+            "{\"time\": \"2026-04-21T10:32-04:00\", \"tz\": \"EDT\"}".to_string()
+        } else {
+            "{\"time\": \"2026-04-21T14:32+00:00\", \"tz\": \"UTC\"}".to_string()
+        }
     } else {
         format!("result({})", code)
+    }
+}
+
+/// A call that has been dispatched but not yet observed as complete.
+struct Pending {
+    id: String,
+    dispatched_at: Instant,
+    fut: Pin<Box<dyn Future<Output = String>>>,
+}
+
+/// Poll a pending future once.  Returns the result if ready.
+fn poll_once(p: &mut Pending) -> Option<String> {
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    match p.fut.as_mut().poll(&mut cx) {
+        Poll::Ready(r) => Some(r),
+        Poll::Pending => None,
     }
 }
 
@@ -375,39 +540,70 @@ async fn main(mut args: Args) -> Result<String> {
     let system: String = args
         .value_from_str(["-s", "--system"])
         .unwrap_or_else(|_| {
-            "You are an assistant that MUST use async function calls to answer.\n\
+            "You are an assistant that uses async function calls (AsyncLM / CML\n\
+             protocol) to answer user questions.\n\
              \n\
-             Syntax (use these delimiters EXACTLY):\n\
-             - Dispatch a call:  [CALL] <id> [HEAD] <code> [END]\n\
-             - Wait for results: [TRAP][END]\n\
+             CML syntax (use these delimiters EXACTLY):\n\
+             - Dispatch (non-blocking): [CALL] <id> [HEAD] <code> [END]\n\
+             - Wait for pending calls:  [TRAP][END]\n\
+             - Result (runtime-injected, you only read): [INTR] <id> [HEAD] <value> [END]\n\
              \n\
-             You have one available function: get_weather(city).\n\
+             Tools available:\n\
+             - get_weather(city: str) -> {\"temp_f\": int, \"sky\": str}\n\
+             - get_stock_price(ticker: str) -> {\"ticker\": str, \"price_usd\": float}\n\
+             - convert_currency(amount: float, from: str, to: str) -> {\"rate\": float, \"quote\": str}\n\
+             - search_restaurants(city: str) -> [str, ...]\n\
+             - get_reviews(name: str) -> {\"stars\": float, \"summary\": str}\n\
+             - get_time(timezone: str) -> {\"time\": str, \"tz\": str}\n\
              \n\
-             WORKFLOW — you MUST follow this exact sequence for every request:\n\
-             1. Acknowledge the request briefly.\n\
-             2. Emit one or more [CALL] blocks to dispatch the needed tools.\n\
-             3. Emit [TRAP][END] to wait for the results. DO NOT write a final\n\
-                answer before the [TRAP][END]. You will not know the result until\n\
-                after the trap, so any answer before it is guessing.\n\
-             4. After [TRAP][END], the results appear as [INTR] <id> [HEAD] <result> [END].\n\
-                Read them and then write a concise natural-language answer.\n\
+             Semantics:\n\
+             - [CALL] blocks are non-blocking. Dispatch all independent calls\n\
+               back-to-back so they run in parallel.\n\
+             - [TRAP][END] pauses generation until every pending [CALL] has\n\
+               returned an [INTR]. Only emit [TRAP][END] when you actually need\n\
+               a result to decide what to do next.\n\
+             - After [INTR] frames appear you may EITHER (a) dispatch another\n\
+               round of [CALL]s whose inputs depend on those results, then\n\
+               [TRAP][END] again, OR (b) write the final natural-language answer\n\
+               and stop. There is no fixed number of rounds.\n\
+             - If part of the question is outside these tools (general knowledge,\n\
+               math, unrelated topics), answer that part from your own knowledge\n\
+               — do NOT invent a [CALL] for it.\n\
+             - Do not put CML syntax inside <think> tags.\n\
+             - Do not fabricate [INTR] frames yourself; the runtime produces them.\n\
              \n\
-             Example:\n\
+             Example 1 — single round, two parallel calls:\n\
              User: What's the weather in NYC and London?\n\
-             Assistant: Let me check both cities.\n\
-             [CALL] w1 [HEAD] get_weather(\"New York\") [END]\n\
+             Assistant: [CALL] w1 [HEAD] get_weather(\"New York\") [END]\n\
              [CALL] w2 [HEAD] get_weather(\"London\") [END]\n\
              [TRAP][END]\n\
-             (results arrive here as [INTR] frames)\n\
+             [INTR] w1 [HEAD] {\"temp_f\": 72, \"sky\": \"sunny\"} [END]\n\
+             [INTR] w2 [HEAD] {\"temp_f\": 60, \"sky\": \"cloudy\"} [END]\n\
              NYC is 72°F and sunny; London is 60°F and cloudy.\n\
              \n\
-             Do NOT put the [CALL] / [TRAP] syntax inside <think> tags. Emit them\n\
-             as your actual response. Never answer without issuing a [TRAP][END]\n\
-             first when a tool call is needed."
+             Example 2 — two rounds, round 2 depends on round 1 results:\n\
+             User: Get the weather in Boston, then also get the weather for a\n\
+             city whose name is that temperature (as a string).\n\
+             Assistant: [CALL] b1 [HEAD] get_weather(\"Boston\") [END]\n\
+             [TRAP][END]\n\
+             [INTR] b1 [HEAD] {\"temp_f\": 68, \"sky\": \"clear\"} [END]\n\
+             Boston is 68°F. Now looking up \"68\".\n\
+             [CALL] b2 [HEAD] get_weather(\"68\") [END]\n\
+             [TRAP][END]\n\
+             [INTR] b2 [HEAD] {\"temp_f\": 72, \"sky\": \"sunny\"} [END]\n\
+             Boston is 68°F and clear; \"68\" is 72°F and sunny.\n\
+             \n\
+             Example 3 — mixed tool + knowledge question:\n\
+             User: What's the weather in Paris and what is the capital of Japan?\n\
+             Assistant: [CALL] p1 [HEAD] get_weather(\"Paris\") [END]\n\
+             [TRAP][END]\n\
+             [INTR] p1 [HEAD] {\"temp_f\": 59, \"sky\": \"rainy\"} [END]\n\
+             Paris is 59°F and rainy. The capital of Japan is Tokyo."
                 .to_string()
         });
     let temperature: f32 = args.value_from_str(["-t", "--temperature"]).unwrap_or(0.6);
     let top_p: f32 = args.value_from_str("--top-p").unwrap_or(0.95);
+    let fake_wait_ms: u64 = args.value_from_str("--fake-wait-ms").unwrap_or(500);
 
     let model = inferlet::get_auto_model();
     let tokenizer = model.get_tokenizer();
@@ -435,26 +631,66 @@ async fn main(mut args: Args) -> Result<String> {
 
     let mut parser = Parser::new(&registry);
     let mut generated: Vec<u32> = Vec::new();
-    let mut pending_results: Vec<String> = Vec::new();
+
+    // In-flight async calls, and results that have completed but not yet injected.
+    let mut pending: Vec<Pending> = Vec::new();
+    let mut ready_frames: Vec<String> = Vec::new();
 
     loop {
         let token_id = ctx.decode_step(&sampler).await;
         ctx.fill_token(token_id);
 
+        // Advance each in-flight call by one poll — concurrent with token generation.
+        // This is the core async-LM property: tool calls progress while tokens are
+        // being sampled, not blocking serial execution.
+        pending.retain_mut(|p| match poll_once(p) {
+            Some(result) => {
+                inferlet::send(&format!(
+                    "[MinAsync] id={} ready after {}ms",
+                    p.id,
+                    p.dispatched_at.elapsed().as_millis()
+                ));
+                ready_frames.push(format!(" [INTR] {} [HEAD] {} [END] ", p.id, result));
+                false
+            }
+            None => true,
+        });
+
         for event in parser.feed(token_id, &tokenizer) {
             match event {
                 Event::Passthrough(t) => generated.push(t),
                 Event::Call { id, code } => {
-                    // Synchronous dummy executor — result ready immediately.
-                    let result = execute_call(&id, &code);
-                    pending_results.push(format!(" [INTR] {} [HEAD] {} [END] ", id, result));
+                    inferlet::send(&format!(
+                        "[MinAsync] dispatching id={} code={} (fake_wait={}ms)",
+                        id, code, fake_wait_ms
+                    ));
+                    pending.push(Pending {
+                        id: id.clone(),
+                        dispatched_at: Instant::now(),
+                        fut: Box::pin(execute_call(id, code, fake_wait_ms)),
+                    });
                 }
                 Event::Trap => {
-                    // Inject any pending results as [INTR] frames.
-                    if pending_results.is_empty() {
-                        inferlet::send("[MinAsync] trap with no pending results, continuing");
+                    // TRAP blocks: force any still-pending futures to completion.
+                    let trap_start = Instant::now();
+                    while !pending.is_empty() {
+                        pending.retain_mut(|p| match poll_once(p) {
+                            Some(result) => {
+                                ready_frames.push(format!(
+                                    " [INTR] {} [HEAD] {} [END] ",
+                                    p.id, result
+                                ));
+                                false
+                            }
+                            None => true,
+                        });
                     }
-                    for frame in pending_results.drain(..) {
+                    inferlet::send(&format!(
+                        "[MinAsync] trap drained in {}ms; injecting {} frames",
+                        trap_start.elapsed().as_millis(),
+                        ready_frames.len()
+                    ));
+                    for frame in ready_frames.drain(..) {
                         inferlet::send(&format!("[MinAsync] injecting: {}", frame.trim()));
                         ctx.fill(&frame);
                     }
@@ -465,7 +701,7 @@ async fn main(mut args: Args) -> Result<String> {
         if stop.check(&generated) { break; }
     }
 
-    for ev in parser.flush() {
+    for ev in parser.flush(&tokenizer) {
         if let Event::Passthrough(t) = ev { generated.push(t); }
     }
 
