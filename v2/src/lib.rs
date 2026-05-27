@@ -106,6 +106,7 @@ fn default_system() -> String {
        frames. Describing a call inside <think> is not the same as making\n\
        the call — you must always emit the literal CML frames outside.\n\
      - Do not fabricate [INTR] frames yourself; the runtime produces them.\n\
+     - Never put plain prose or explanations inside [CALL]; [CALL] bodies must be one of the listed tool functions.\n\
      \n\
      Example 1 — single round, two parallel calls:\n\
      User: What's the weather in NYC and London?\n\
