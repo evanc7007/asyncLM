@@ -1,0 +1,12 @@
+[package]
+name = "asynclm-v2"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+inferlet = { path = "../../sdk/rust/inferlet" }
+inferlet-macros = { path = "../../sdk/rust/inferlet-macros" }
+serde = { version = "1.0", features = ["derive"] }

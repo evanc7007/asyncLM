@@ -1,15 +1,6 @@
-[package]
-name = "asyncLM"
-version = "0.1.0"
-edition = "2024"
-
-[lib]
-path = "src/lib2.rs"
-crate-type = ["cdylib"]
-
-[dependencies]
-inferlet = { path = "../sdk/rust/inferlet" }
-inferlet-macros = { path = "../sdk/rust/inferlet-macros" }
+[workspace]
+resolver = "3"
+members = ["v1", "v2", "v3"]
 
 [profile.release]
 lto = true
