@@ -61,7 +61,7 @@ struct Input {
     fake_wait_ms: u64,
 }
 
-fn default_max_tokens() -> usize { 512 }
+fn default_max_tokens() -> usize { 2048 }
 fn default_temperature() -> f32 { 0.6 }
 fn default_top_p() -> f32 { 0.95 }
 fn default_fake_wait_ms() -> u64 { 500 }
