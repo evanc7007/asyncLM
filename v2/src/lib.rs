@@ -192,88 +192,28 @@ struct CmlRegistry {
 
 impl CmlRegistry {
     fn new(tokenizer: &Tokenizer) -> Self {
-        let (special_ids, special_bytes) = tokenizer.special_tokens();
-        let special_map: HashMap<Vec<u8>, u32> = special_bytes
-            .into_iter()
-            .zip(special_ids.into_iter())
-            .collect();
-
-        let resolve = |s: &str| -> Vec<u32> {
-            if let Some(&id) = special_map.get(s.as_bytes()) {
-                vec![id]
-            } else {
-                let ids = tokenizer.encode(s);
-                assert!(!ids.is_empty(), "CML token '{}' tokenized to empty", s);
-                ids
-            }
+        let special_map = build_special_map(tokenizer);
+        let resolve = |s: &str| resolve_token(s, &special_map, tokenizer);
+        let require = |s: &str| {
+            let ids = resolve(s);
+            assert!(!ids.is_empty(), "CML token '{}' tokenized to empty", s);
+            ids
         };
 
-        let call_ids = resolve("[CALL]");
-        let end_ids = resolve("[END]");
-        let head_ids = resolve("[HEAD]");
-        let trap_ids = resolve("[TRAP]");
-        let intr_ids = resolve("[INTR]");
+        let call_ids = require("[CALL]");
+        let end_ids = require("[END]");
+        let head_ids = require("[HEAD]");
+        let trap_ids = require("[TRAP]");
+        let intr_ids = require("[INTR]");
 
-        // Combined [TRAP][END] — plus BPE-merged `][` variant if present.
-        let mut trap_end_ids = vec![trap_ids
-            .iter()
-            .chain(end_ids.iter())
-            .cloned()
-            .collect::<Vec<u32>>()];
-        let merge = tokenizer.encode("][");
-        if merge.len() == 1 && !trap_ids.is_empty() && !end_ids.is_empty() {
-            let mut merged: Vec<u32> = trap_ids[..trap_ids.len() - 1].to_vec();
-            merged.push(merge[0]);
-            merged.extend_from_slice(&end_ids[1..]);
-            trap_end_ids.push(merged);
-        }
+        let trap_end_ids = build_trap_end_variants(&trap_ids, &end_ids, tokenizer);
+        let close_bracket_alts = collect_close_bracket_alts(tokenizer);
+        let suppressed = compute_intr_suppression(&call_ids, &end_ids, &head_ids, &trap_ids, &intr_ids);
 
-        // BPE-merged closing-bracket variants. The matchers expect every
-        // delimiter to end at the canonical `]` token, but the tokenizer
-        // routinely fuses `]` with the immediately-following byte into a
-        // single token (`]\n`, `][`, `] `, etc.). Without these alternates
-        // the suffix match silently fails on the final position and the
-        // FSM stays stuck in InCallBody / InCallId / InTrap forever.
-        let (vocab_ids, vocab_bytes) = tokenizer.vocabs();
-        let mut close_bracket_alts: Vec<u32> = Vec::new();
-        for (&id, bytes) in vocab_ids.iter().zip(vocab_bytes.iter()) {
-            if !bytes.is_empty() && bytes[0] == b']' {
-                close_bracket_alts.push(id);
-            }
-        }
-
-        // Suppress only tokens *unique* to [INTR]. Shared `[` / `]` must
-        // stay sampleable — they're needed for [CALL] / [TRAP] / [END].
-        let shared: HashSet<u32> = call_ids
-            .iter()
-            .chain(end_ids.iter())
-            .chain(head_ids.iter())
-            .chain(trap_ids.iter())
-            .copied()
-            .collect();
-        let suppressed: HashSet<u32> = intr_ids
-            .iter()
-            .copied()
-            .filter(|id| !shared.contains(id))
-            .collect();
-
-        // Qwen3 think delimiters. Resolved via the same special-map →
-        // encode fallback as the CML delimiters. Empty Vec on tokenizers
-        // that lack the tag (Qwen2.5 etc.) — the bypass becomes a no-op.
-        let resolve_optional = |s: &str| -> Vec<u32> {
-            if let Some(&id) = special_map.get(s.as_bytes()) {
-                vec![id]
-            } else {
-                let ids = tokenizer.encode(s);
-                if ids.is_empty() {
-                    Vec::new()
-                } else {
-                    ids
-                }
-            }
-        };
-        let think_open_ids = resolve_optional("<think>");
-        let think_close_ids = resolve_optional("</think>");
+        // Qwen3 think delimiters — empty Vec on tokenizers that lack them
+        // (Qwen2.5 etc.), in which case the bypass is a no-op.
+        let think_open_ids = resolve("<think>");
+        let think_close_ids = resolve("</think>");
 
         CmlRegistry {
             call_ids,
@@ -290,6 +230,71 @@ impl CmlRegistry {
     }
 }
 
+fn build_special_map(tokenizer: &Tokenizer) -> HashMap<Vec<u8>, u32> {
+    let (special_ids, special_bytes) = tokenizer.special_tokens();
+    special_bytes
+        .into_iter()
+        .zip(special_ids.into_iter())
+        .collect()
+}
+
+fn resolve_token(s: &str, special_map: &HashMap<Vec<u8>, u32>, tokenizer: &Tokenizer) -> Vec<u32> {
+    if let Some(&id) = special_map.get(s.as_bytes()) {
+        vec![id]
+    } else {
+        tokenizer.encode(s)
+    }
+}
+
+fn build_trap_end_variants(trap_ids: &[u32], end_ids: &[u32], tokenizer: &Tokenizer) -> Vec<Vec<u32>> {
+    let mut variants = vec![trap_ids.iter().chain(end_ids.iter()).copied().collect::<Vec<u32>>()];
+    let merge = tokenizer.encode("][");
+    if merge.len() == 1 && !trap_ids.is_empty() && !end_ids.is_empty() {
+        let mut merged: Vec<u32> = trap_ids[..trap_ids.len() - 1].to_vec();
+        merged.push(merge[0]);
+        merged.extend_from_slice(&end_ids[1..]);
+        variants.push(merged);
+    }
+    variants
+}
+
+/// Every vocab token whose decoded bytes start with `]`. The suffix matcher
+/// accepts any of these in place of the canonical `]` so BPE-fused trailing
+/// brackets (`]\n`, `][`, `] `, …) still close out a delimiter. Without
+/// this the FSM jams in InCallBody/InCallId forever — failures are silent.
+fn collect_close_bracket_alts(tokenizer: &Tokenizer) -> Vec<u32> {
+    let (vocab_ids, vocab_bytes) = tokenizer.vocabs();
+    vocab_ids
+        .iter()
+        .zip(vocab_bytes.iter())
+        .filter(|(_, bytes)| !bytes.is_empty() && bytes[0] == b']')
+        .map(|(&id, _)| id)
+        .collect()
+}
+
+/// Suppress only tokens *unique* to `[INTR]`. Shared `[` / `]` must stay
+/// sampleable — they're needed for `[CALL]` / `[TRAP]` / `[END]`.
+fn compute_intr_suppression(
+    call_ids: &[u32],
+    end_ids: &[u32],
+    head_ids: &[u32],
+    trap_ids: &[u32],
+    intr_ids: &[u32],
+) -> HashSet<u32> {
+    let shared: HashSet<u32> = call_ids
+        .iter()
+        .chain(end_ids.iter())
+        .chain(head_ids.iter())
+        .chain(trap_ids.iter())
+        .copied()
+        .collect();
+    intr_ids
+        .iter()
+        .copied()
+        .filter(|id| !shared.contains(id))
+        .collect()
+}
+
 // ============================================================================
 // Constraint — block the [INTR]-unique token ids
 //
@@ -304,23 +309,24 @@ struct SuppressMask {
 }
 
 impl SuppressMask {
+    /// BRLE: alternating run lengths starting from `false` (disallowed).
+    /// An initial run-length of 0 is used when id 0 happens to be allowed.
     fn new(mask_size: u32, suppressed: &HashSet<u32>) -> Self {
-        // BRLE alternates false/true runs starting with `false`.
-        let mut buf: Vec<u32> = Vec::new();
-        let mut current_val = false;
-        let mut current_count: u32 = 0;
-        for i in 0..mask_size {
-            let allowed = !suppressed.contains(&i);
-            if allowed == current_val {
-                current_count += 1;
+        let mut mask: Vec<u32> = Vec::new();
+        let mut run_value = false;
+        let mut run_len: u32 = 0;
+        for id in 0..mask_size {
+            let allowed = !suppressed.contains(&id);
+            if allowed == run_value {
+                run_len += 1;
             } else {
-                buf.push(current_count);
-                current_val = !current_val;
-                current_count = 1;
+                mask.push(run_len);
+                run_value = !run_value;
+                run_len = 1;
             }
         }
-        buf.push(current_count);
-        Self { mask: buf }
+        mask.push(run_len);
+        Self { mask }
     }
 }
 
@@ -363,16 +369,16 @@ enum Delim {
 }
 
 struct Parser {
-    // Full sequences (Normal-state matching).
+    // Full sequences (leading `[` present as its own token).
     call_ids: Vec<u32>,
     end_ids: Vec<u32>,
     head_ids: Vec<u32>,
     trap_ids: Vec<u32>,
     intr_ids: Vec<u32>,
     trap_end_ids: Vec<Vec<u32>>,
-    // Bracket-free inner suffixes — same delimiters with the leading bracket
-    // token dropped. Used to catch BPE-merged leading brackets (`\n[`, ` [`)
-    // where the `[` is fused into the previous token.
+    // Bracket-free inner suffixes — leading-bracket token dropped. Used to
+    // catch BPE-merged leading brackets (`\n[`, ` [`) where the `[` is
+    // fused into the previous token.
     call_inner: Vec<u32>,
     end_inner: Vec<u32>,
     head_inner: Vec<u32>,
@@ -389,10 +395,6 @@ struct Parser {
     in_think: bool,
     think_buf: Vec<u32>,
 
-    /// Tokens that decode to a string starting with `]`. Treated as
-    /// equivalent to the canonical `]` token when matching the final
-    /// position of a delimiter, so e.g. `]\n` (a single fused token)
-    /// closes `[END]` correctly.
     close_bracket_alts: Vec<u32>,
 
     state: State,
@@ -429,8 +431,7 @@ impl Parser {
     }
 
     /// Observe a freshly-emitted token for `<think>` / `</think>` boundaries
-    /// and update `in_think`. Returns true if this token was part of a think
-    /// boundary (caller will still pass it through).
+    /// and update `in_think`.
     fn observe_think_boundary(&mut self, token_id: u32) {
         // Single-token boundary fast path.
         if self.think_open_ids.len() == 1 && self.think_open_ids[0] == token_id {
@@ -465,52 +466,32 @@ impl Parser {
         }
     }
 
-    /// True if `buf` ends with `pat`, treating any `close_bracket_alts`
-    /// token as equivalent to the canonical `]` (token IDs in
-    /// `close_bracket_alts`). Specifically, positions where `pat` is one of
-    /// those alts may be filled by any of the alts in `buf`. The non-`]`
-    /// positions still match strictly.
+    /// Position-level equivalence used by both `ends_with` and `is_prefix`:
+    /// equal token ids match, and any `close_bracket_alts` token is
+    /// interchangeable with another (so `]\n` stands in for the canonical
+    /// `]`).
+    fn pos_eq(&self, b: u32, p: u32) -> bool {
+        b == p
+            || (self.close_bracket_alts.contains(&p) && self.close_bracket_alts.contains(&b))
+    }
+
     fn ends_with(&self, buf: &[u32], pat: &[u32]) -> bool {
         if pat.is_empty() || buf.len() < pat.len() {
             return false;
         }
         let off = buf.len() - pat.len();
-        for (i, &p) in pat.iter().enumerate() {
-            let b = buf[off + i];
-            if b == p {
-                continue;
-            }
-            // Allow any closing-bracket variant to stand in for the
-            // canonical `]` (or vice versa).
-            if self.close_bracket_alts.contains(&p)
-                && self.close_bracket_alts.contains(&b)
-            {
-                continue;
-            }
-            return false;
-        }
-        true
+        pat.iter()
+            .enumerate()
+            .all(|(i, &p)| self.pos_eq(buf[off + i], p))
     }
 
-    /// True if `buf` is a prefix of `pat`, with the same `]`-equivalence
-    /// rule as `ends_with`.
     fn is_prefix(&self, buf: &[u32], pat: &[u32]) -> bool {
         if pat.is_empty() || buf.len() > pat.len() {
             return false;
         }
-        for (i, &b) in buf.iter().enumerate() {
-            let p = pat[i];
-            if b == p {
-                continue;
-            }
-            if self.close_bracket_alts.contains(&p)
-                && self.close_bracket_alts.contains(&b)
-            {
-                continue;
-            }
-            return false;
-        }
-        true
+        buf.iter()
+            .enumerate()
+            .all(|(i, &b)| self.pos_eq(b, pat[i]))
     }
 
     fn match_full(&self, buf: &[u32]) -> (Delim, usize) {
@@ -556,10 +537,10 @@ impl Parser {
         (Delim::None, 0)
     }
 
-    /// Like `match_inner` but restricted to delimiters that can appear at
-    /// the top level in Normal state: [CALL], [TRAP], [TRAP][END]. Used to
-    /// catch the case where the leading `[` of a top-level delimiter has
-    /// been BPE-merged into the previous token.
+    /// `match_inner` restricted to delimiters that can appear at top level
+    /// in Normal state ([CALL], [TRAP], [TRAP][END], [INTR]). Catches the
+    /// case where the leading `[` of a top-level delimiter has been
+    /// BPE-merged into the previous token.
     fn match_normal_inner(&self, buf: &[u32]) -> (Delim, usize) {
         for s in &self.trap_end_inner {
             if self.ends_with(buf, s) {
@@ -578,41 +559,93 @@ impl Parser {
         (Delim::None, 0)
     }
 
+    /// Try full-match first; fall back to inner-match (BPE-merged leading
+    /// bracket). Used by every state except Normal.
+    fn match_full_or_inner(&self, buf: &[u32]) -> (Delim, usize) {
+        let r = self.match_full(buf);
+        if r.0 != Delim::None { r } else { self.match_inner(buf) }
+    }
+
+    /// Normal-state variant: full-match first, then `match_normal_inner`
+    /// (only delimiters legal at top level).
+    fn match_full_or_normal_inner(&self, buf: &[u32]) -> (Delim, usize) {
+        let r = self.match_full(buf);
+        if r.0 != Delim::None { r } else { self.match_normal_inner(buf) }
+    }
+
     fn is_prefix_of_any(&self, buf: &[u32]) -> bool {
-        self.is_prefix(buf, &self.call_ids)
-            || self.is_prefix(buf, &self.end_ids)
-            || self.is_prefix(buf, &self.trap_ids)
-            || self.is_prefix(buf, &self.intr_ids)
-            || self.is_prefix(buf, &self.head_ids)
-            || self.trap_end_ids.iter().any(|s| self.is_prefix(buf, s))
-            || self.is_prefix(buf, &self.call_inner)
-            || self.is_prefix(buf, &self.end_inner)
-            || self.is_prefix(buf, &self.trap_inner)
-            || self.is_prefix(buf, &self.intr_inner)
-            || self.is_prefix(buf, &self.head_inner)
-            || self.trap_end_inner.iter().any(|s| self.is_prefix(buf, s))
+        self.all_delim_patterns().any(|pat| self.is_prefix(buf, pat))
+    }
+
+    fn all_delim_patterns(&self) -> impl Iterator<Item = &[u32]> {
+        let singles: [&[u32]; 10] = [
+            &self.call_ids,
+            &self.end_ids,
+            &self.trap_ids,
+            &self.intr_ids,
+            &self.head_ids,
+            &self.call_inner,
+            &self.end_inner,
+            &self.trap_inner,
+            &self.intr_inner,
+            &self.head_inner,
+        ];
+        let trap_end_full = self.trap_end_ids.iter().map(|s| s.as_slice());
+        let trap_end_inner = self.trap_end_inner.iter().map(|s| s.as_slice());
+        singles.into_iter().chain(trap_end_full).chain(trap_end_inner)
     }
 
     fn detokenize_one(tokenizer: &Tokenizer, t: u32) -> String {
         tokenizer.decode(&[t]).unwrap_or_default()
     }
 
+    /// Tokens whose decoded bytes end with `[` are potential delimiter
+    /// starts; if the delimiter never forms (usually because the [INTR]
+    /// continuation was suppressed), we drop them rather than leak a stray
+    /// `[` into passthrough.
+    fn is_partial_delim_start(t: u32, tokenizer: &Tokenizer) -> bool {
+        Self::detokenize_one(tokenizer, t).ends_with('[')
+    }
+
     fn strip_trailing_bracket(tokens: &mut Vec<u32>, tokenizer: &Tokenizer) {
-        if let Some(&last) = tokens.last() {
-            if Self::detokenize_one(tokenizer, last).ends_with('[') {
-                tokens.pop();
-            }
+        if tokens.last().is_some_and(|&t| Self::is_partial_delim_start(t, tokenizer)) {
+            tokens.pop();
+        }
+    }
+
+    /// Emit `self.buf[..buf.len() - dlen]` as Passthrough events (stripping
+    /// the trailing `[` that opens the matched delimiter), then clear buf.
+    fn emit_prefix_and_consume(
+        &mut self,
+        dlen: usize,
+        tokenizer: &Tokenizer,
+        events: &mut Vec<Event>,
+    ) {
+        let end = self.buf.len() - dlen;
+        let mut prefix: Vec<u32> = self.buf[..end].to_vec();
+        Self::strip_trailing_bracket(&mut prefix, tokenizer);
+        events.extend(prefix.into_iter().map(Event::Passthrough));
+        self.buf.clear();
+    }
+
+    /// Pop one token from the front of `self.buf` and emit it as
+    /// Passthrough unless it's a partial-delimiter start (in which case
+    /// drop it). Used to drain `buf` token-by-token while it can't be the
+    /// start of any delimiter.
+    fn drain_front_as_passthrough(&mut self, tokenizer: &Tokenizer, events: &mut Vec<Event>) {
+        let t = self.buf.remove(0);
+        if !Self::is_partial_delim_start(t, tokenizer) {
+            events.push(Event::Passthrough(t));
         }
     }
 
     fn feed(&mut self, token_id: u32, tokenizer: &Tokenizer) -> Vec<Event> {
         let mut events = Vec::new();
 
-        // Think-block bypass: while the model is inside <think>…</think>,
-        // suspend CML matching and pass tokens through verbatim. The model
-        // routinely quotes literal `[CALL]` / `[TRAP][END]` while reasoning
-        // about how to format its answer, and the parser must not act on
-        // those.
+        // Think-block bypass: while inside <think>…</think>, suspend CML
+        // matching and pass tokens through verbatim — the model routinely
+        // quotes literal CML while reasoning about how to format its
+        // answer, and the parser must not act on those.
         let was_in_think = self.in_think;
         self.observe_think_boundary(token_id);
         if was_in_think || self.in_think {
@@ -621,256 +654,184 @@ impl Parser {
         }
 
         match self.state {
-            State::Normal => {
-                self.buf.push(token_id);
-                // Try full match (leading `[` present as its own token)
-                // first; fall back to bracket-free inner match to catch
-                // BPE-merged leading brackets like ` [` or `\n[`.
-                let (d, dlen) = {
-                    let (d, l) = self.match_full(&self.buf);
-                    if d != Delim::None {
-                        (d, l)
-                    } else {
-                        self.match_normal_inner(&self.buf)
-                    }
-                };
-                match d {
-                    Delim::Call => {
-                        let end = self.buf.len() - dlen;
-                        let mut prefix: Vec<u32> = self.buf[..end].to_vec();
-                        Self::strip_trailing_bracket(&mut prefix, tokenizer);
-                        for t in prefix {
-                            events.push(Event::Passthrough(t));
-                        }
-                        self.buf.clear();
-                        self.id_tokens.clear();
-                        self.body_tokens.clear();
-                        self.state = State::InCallId;
-                    }
-                    Delim::Trap => {
-                        let end = self.buf.len() - dlen;
-                        let mut prefix: Vec<u32> = self.buf[..end].to_vec();
-                        Self::strip_trailing_bracket(&mut prefix, tokenizer);
-                        for t in prefix {
-                            events.push(Event::Passthrough(t));
-                        }
-                        self.buf.clear();
-                        self.state = State::InTrap;
-                    }
-                    Delim::TrapEnd => {
-                        let end = self.buf.len() - dlen;
-                        let mut prefix: Vec<u32> = self.buf[..end].to_vec();
-                        Self::strip_trailing_bracket(&mut prefix, tokenizer);
-                        for t in prefix {
-                            events.push(Event::Passthrough(t));
-                        }
-                        self.buf.clear();
-                        events.push(Event::Trap);
-                    }
-                    Delim::Intr => {
-                        let end = self.buf.len() - dlen;
-                        let mut prefix: Vec<u32> = self.buf[..end].to_vec();
-                        Self::strip_trailing_bracket(&mut prefix, tokenizer);
-                        for t in prefix {
-                            events.push(Event::Passthrough(t));
-                        }
-                        self.buf.clear();
-                        self.state = State::InIntrId;
-                    }
-                    Delim::None => {
-                        while !self.buf.is_empty() && !self.is_prefix_of_any(&self.buf) {
-                            let t = self.buf.remove(0);
-                            // A token that decodes ending with `[` was held
-                            // as a potential delimiter start but no delim
-                            // formed — typically the aborted result of
-                            // [INTR] suppression. Drop rather than leak a
-                            // stray `[` into the passthrough stream.
-                            if Self::detokenize_one(tokenizer, t).ends_with('[') {
-                                continue;
-                            }
-                            events.push(Event::Passthrough(t));
-                        }
-                    }
-                    _ => {
-                        for &t in &self.buf {
-                            if Self::detokenize_one(tokenizer, t).ends_with('[') {
-                                continue;
-                            }
-                            events.push(Event::Passthrough(t));
-                        }
-                        self.buf.clear();
-                    }
-                }
-            }
-
-            State::InCallId => {
-                self.buf.push(token_id);
-                let (d, dlen) = {
-                    let (d, l) = self.match_full(&self.buf);
-                    if d != Delim::None {
-                        (d, l)
-                    } else {
-                        self.match_inner(&self.buf)
-                    }
-                };
-                match d {
-                    Delim::Head => {
-                        let id_end = self.buf.len() - dlen;
-                        self.id_tokens.extend_from_slice(&self.buf[..id_end]);
-                        self.buf.clear();
-                        Self::strip_trailing_bracket(&mut self.id_tokens, tokenizer);
-                        self.state = State::InCallBody;
-                    }
-                    Delim::End => {
-                        let id_end = self.buf.len() - dlen;
-                        self.id_tokens.extend_from_slice(&self.buf[..id_end]);
-                        self.buf.clear();
-                        Self::strip_trailing_bracket(&mut self.id_tokens, tokenizer);
-                        let id = tokenizer
-                            .decode(&self.id_tokens)
-                            .unwrap_or_default()
-                            .trim()
-                            .to_string();
-                        events.push(Event::Call {
-                            id,
-                            code: String::new(),
-                        });
-                        self.state = State::Normal;
-                    }
-                    Delim::None => {
-                        if !self.is_prefix_of_any(&self.buf) {
-                            self.id_tokens.extend_from_slice(&self.buf);
-                            self.buf.clear();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            State::InCallBody => {
-                self.buf.push(token_id);
-                let (d, dlen) = {
-                    let (d, l) = self.match_full(&self.buf);
-                    if d != Delim::None {
-                        (d, l)
-                    } else {
-                        self.match_inner(&self.buf)
-                    }
-                };
-                match d {
-                    Delim::End => {
-                        let body_end = self.buf.len() - dlen;
-                        self.body_tokens.extend_from_slice(&self.buf[..body_end]);
-                        self.buf.clear();
-                        Self::strip_trailing_bracket(&mut self.body_tokens, tokenizer);
-                        let id = tokenizer
-                            .decode(&self.id_tokens)
-                            .unwrap_or_default()
-                            .trim()
-                            .to_string();
-                        let code = tokenizer
-                            .decode(&self.body_tokens)
-                            .unwrap_or_default()
-                            .trim()
-                            .to_string();
-                        events.push(Event::Call { id, code });
-                        self.state = State::Normal;
-                    }
-                    Delim::None => {
-                        if !self.is_prefix_of_any(&self.buf) {
-                            self.body_tokens.extend_from_slice(&self.buf);
-                            self.buf.clear();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            State::InTrap => {
-                self.buf.push(token_id);
-                let (d, _) = {
-                    let (d, l) = self.match_full(&self.buf);
-                    if d != Delim::None {
-                        (d, l)
-                    } else {
-                        self.match_inner(&self.buf)
-                    }
-                };
-                match d {
-                    Delim::End => {
-                        self.buf.clear();
-                        events.push(Event::Trap);
-                        self.state = State::Normal;
-                    }
-                    Delim::None => {
-                        if !self.is_prefix_of_any(&self.buf) {
-                            self.buf.clear();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            State::InIntrId => {
-                self.buf.push(token_id);
-                let (d, _) = {
-                    let (d, l) = self.match_full(&self.buf);
-                    if d != Delim::None {
-                        (d, l)
-                    } else {
-                        self.match_inner(&self.buf)
-                    }
-                };
-                match d {
-                    Delim::Head => {
-                        self.buf.clear();
-                        self.state = State::InIntrBody;
-                    }
-                    Delim::End => {
-                        self.buf.clear();
-                        self.state = State::Normal;
-                    }
-                    Delim::None => {
-                        if !self.is_prefix_of_any(&self.buf) {
-                            self.buf.clear();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            State::InIntrBody => {
-                self.buf.push(token_id);
-                let (d, _) = {
-                    let (d, l) = self.match_full(&self.buf);
-                    if d != Delim::None {
-                        (d, l)
-                    } else {
-                        self.match_inner(&self.buf)
-                    }
-                };
-                match d {
-                    Delim::End => {
-                        self.buf.clear();
-                        self.state = State::Normal;
-                    }
-                    Delim::None => {
-                        if !self.is_prefix_of_any(&self.buf) {
-                            self.buf.clear();
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            State::Normal => self.feed_normal(token_id, tokenizer, &mut events),
+            State::InCallId => self.feed_in_call_id(token_id, tokenizer, &mut events),
+            State::InCallBody => self.feed_in_call_body(token_id, tokenizer, &mut events),
+            State::InTrap => self.feed_in_trap(token_id, &mut events),
+            State::InIntrId => self.feed_in_intr_id(token_id),
+            State::InIntrBody => self.feed_in_intr_body(token_id),
         }
 
         events
     }
 
+    fn feed_normal(&mut self, token_id: u32, tokenizer: &Tokenizer, events: &mut Vec<Event>) {
+        self.buf.push(token_id);
+        let (d, dlen) = self.match_full_or_normal_inner(&self.buf);
+        match d {
+            Delim::Call => {
+                self.emit_prefix_and_consume(dlen, tokenizer, events);
+                self.id_tokens.clear();
+                self.body_tokens.clear();
+                self.state = State::InCallId;
+            }
+            Delim::Trap => {
+                self.emit_prefix_and_consume(dlen, tokenizer, events);
+                self.state = State::InTrap;
+            }
+            Delim::TrapEnd => {
+                self.emit_prefix_and_consume(dlen, tokenizer, events);
+                events.push(Event::Trap);
+            }
+            Delim::Intr => {
+                self.emit_prefix_and_consume(dlen, tokenizer, events);
+                self.state = State::InIntrId;
+            }
+            Delim::None => {
+                while !self.buf.is_empty() && !self.is_prefix_of_any(&self.buf) {
+                    self.drain_front_as_passthrough(tokenizer, events);
+                }
+            }
+            // End/Head matched at top level — should not occur, but drain
+            // conservatively rather than leaving the buffer indefinitely.
+            _ => {
+                let drained: Vec<u32> = self.buf.drain(..).collect();
+                for t in drained {
+                    if !Self::is_partial_delim_start(t, tokenizer) {
+                        events.push(Event::Passthrough(t));
+                    }
+                }
+            }
+        }
+    }
+
+    fn feed_in_call_id(&mut self, token_id: u32, tokenizer: &Tokenizer, events: &mut Vec<Event>) {
+        self.buf.push(token_id);
+        let (d, dlen) = self.match_full_or_inner(&self.buf);
+        match d {
+            Delim::Head => {
+                let id_end = self.buf.len() - dlen;
+                self.id_tokens.extend_from_slice(&self.buf[..id_end]);
+                self.buf.clear();
+                Self::strip_trailing_bracket(&mut self.id_tokens, tokenizer);
+                self.state = State::InCallBody;
+            }
+            Delim::End => {
+                let id_end = self.buf.len() - dlen;
+                self.id_tokens.extend_from_slice(&self.buf[..id_end]);
+                self.buf.clear();
+                Self::strip_trailing_bracket(&mut self.id_tokens, tokenizer);
+                // Decode error → empty id, runtime keeps going (best-effort).
+                let id = tokenizer
+                    .decode(&self.id_tokens)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                events.push(Event::Call { id, code: String::new() });
+                self.state = State::Normal;
+            }
+            Delim::None => {
+                if !self.is_prefix_of_any(&self.buf) {
+                    self.id_tokens.extend_from_slice(&self.buf);
+                    self.buf.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn feed_in_call_body(&mut self, token_id: u32, tokenizer: &Tokenizer, events: &mut Vec<Event>) {
+        self.buf.push(token_id);
+        let (d, dlen) = self.match_full_or_inner(&self.buf);
+        match d {
+            Delim::End => {
+                let body_end = self.buf.len() - dlen;
+                self.body_tokens.extend_from_slice(&self.buf[..body_end]);
+                self.buf.clear();
+                Self::strip_trailing_bracket(&mut self.body_tokens, tokenizer);
+                let id = tokenizer
+                    .decode(&self.id_tokens)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let code = tokenizer
+                    .decode(&self.body_tokens)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                events.push(Event::Call { id, code });
+                self.state = State::Normal;
+            }
+            Delim::None => {
+                if !self.is_prefix_of_any(&self.buf) {
+                    self.body_tokens.extend_from_slice(&self.buf);
+                    self.buf.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn feed_in_trap(&mut self, token_id: u32, events: &mut Vec<Event>) {
+        self.buf.push(token_id);
+        let (d, _) = self.match_full_or_inner(&self.buf);
+        match d {
+            Delim::End => {
+                self.buf.clear();
+                events.push(Event::Trap);
+                self.state = State::Normal;
+            }
+            Delim::None => {
+                if !self.is_prefix_of_any(&self.buf) {
+                    self.buf.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn feed_in_intr_id(&mut self, token_id: u32) {
+        self.buf.push(token_id);
+        let (d, _) = self.match_full_or_inner(&self.buf);
+        match d {
+            Delim::Head => {
+                self.buf.clear();
+                self.state = State::InIntrBody;
+            }
+            Delim::End => {
+                self.buf.clear();
+                self.state = State::Normal;
+            }
+            Delim::None => {
+                if !self.is_prefix_of_any(&self.buf) {
+                    self.buf.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn feed_in_intr_body(&mut self, token_id: u32) {
+        self.buf.push(token_id);
+        let (d, _) = self.match_full_or_inner(&self.buf);
+        match d {
+            Delim::End => {
+                self.buf.clear();
+                self.state = State::Normal;
+            }
+            Delim::None => {
+                if !self.is_prefix_of_any(&self.buf) {
+                    self.buf.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn flush(&mut self, tokenizer: &Tokenizer) -> Vec<Event> {
         self.buf
             .drain(..)
-            .filter(|&t| !Self::detokenize_one(tokenizer, t).ends_with('['))
+            .filter(|&t| !Self::is_partial_delim_start(t, tokenizer))
             .map(Event::Passthrough)
             .collect()
     }
@@ -895,7 +856,10 @@ fn noop_waker() -> Waker {
     unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
 }
 
-async fn execute_call(id: String, code: String, wait_ms: u64) -> String {
+/// Yield `Poll::Pending` until `wait_ms` has elapsed. The cooperative
+/// `wake_by_ref` is what makes the hand-polled futures progress once per
+/// decode step.
+async fn wait_until_deadline(wait_ms: u64) {
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
     poll_fn(|cx| {
         if Instant::now() >= deadline {
@@ -906,90 +870,157 @@ async fn execute_call(id: String, code: String, wait_ms: u64) -> String {
         }
     })
     .await;
+}
 
+async fn execute_call(id: String, code: String, wait_ms: u64) -> String {
+    wait_until_deadline(wait_ms).await;
     println!("[MinAsync] call id={} completed (wait {}ms)", id, wait_ms);
-    let lc = code.to_lowercase();
+    canned_result(&code.to_lowercase())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("result({})", code))
+}
 
+/// Dispatch the lowercased call body to the right canned-result function.
+/// Returns `None` when no tool name matches; the caller falls back to
+/// `result(<code>)`.
+fn canned_result(lc: &str) -> Option<&'static str> {
     if lc.contains("get_weather") || lc.contains("weather(") {
-        if lc.contains("london") {
-            "{\"temp_f\": 60, \"sky\": \"cloudy\"}".to_string()
-        } else if lc.contains("paris") {
-            "{\"temp_f\": 59, \"sky\": \"rainy\"}".to_string()
-        } else if lc.contains("boston") {
-            "{\"temp_f\": 68, \"sky\": \"clear\"}".to_string()
-        } else if lc.contains("tokyo") {
-            "{\"temp_f\": 75, \"sky\": \"humid\"}".to_string()
-        } else {
-            "{\"temp_f\": 72, \"sky\": \"sunny\"}".to_string()
-        }
+        Some(weather_result(lc))
     } else if lc.contains("stock_price") || lc.contains("get_stock") {
-        if lc.contains("aapl") {
-            "{\"ticker\": \"AAPL\", \"price_usd\": 189.50}".to_string()
-        } else if lc.contains("goog") {
-            "{\"ticker\": \"GOOG\", \"price_usd\": 141.20}".to_string()
-        } else if lc.contains("tsla") {
-            "{\"ticker\": \"TSLA\", \"price_usd\": 258.30}".to_string()
-        } else {
-            "{\"ticker\": \"UNKNOWN\", \"price_usd\": 100.00}".to_string()
-        }
+        Some(stock_result(lc))
     } else if lc.contains("convert_currency") || lc.contains("exchange_rate") {
-        if lc.contains("eur") {
-            "{\"rate\": 0.92, \"quote\": \"USD->EUR\"}".to_string()
-        } else if lc.contains("jpy") {
-            "{\"rate\": 155.40, \"quote\": \"USD->JPY\"}".to_string()
-        } else if lc.contains("gbp") {
-            "{\"rate\": 0.79, \"quote\": \"USD->GBP\"}".to_string()
-        } else {
-            "{\"rate\": 1.00, \"quote\": \"USD->USD\"}".to_string()
-        }
+        Some(currency_result(lc))
     } else if lc.contains("search_restaurants") || lc.contains("find_restaurants") {
-        if lc.contains("tokyo") {
-            "[\"Sukiyabashi Jiro\", \"Ichiran\", \"Sushi Saito\"]".to_string()
-        } else if lc.contains("paris") {
-            "[\"Le Jules Verne\", \"L'Ami Jean\", \"Septime\"]".to_string()
-        } else {
-            "[\"Katz's Deli\", \"Joe's Pizza\", \"Lombardi's\"]".to_string()
-        }
+        Some(restaurants_result(lc))
     } else if lc.contains("get_reviews") || lc.contains("reviews(") {
-        if lc.contains("katz") {
-            "{\"stars\": 4.6, \"summary\": \"Iconic pastrami sandwiches\"}".to_string()
-        } else if lc.contains("jiro") {
-            "{\"stars\": 4.9, \"summary\": \"Legendary omakase, tiny counter\"}".to_string()
-        } else if lc.contains("joe") {
-            "{\"stars\": 4.4, \"summary\": \"Classic NY slice, cheap and fast\"}".to_string()
-        } else {
-            "{\"stars\": 4.0, \"summary\": \"Solid, well-reviewed spot\"}".to_string()
-        }
+        Some(reviews_result(lc))
     } else if lc.contains("get_time") || lc.contains("time_in") || lc.contains("current_time") {
-        if lc.contains("tokyo") || lc.contains("jst") {
-            "{\"time\": \"2026-04-21T23:32+09:00\", \"tz\": \"JST\"}".to_string()
-        } else if lc.contains("london") || lc.contains("gmt") {
-            "{\"time\": \"2026-04-21T15:32+01:00\", \"tz\": \"BST\"}".to_string()
-        } else if lc.contains("new_york") || lc.contains("nyc") || lc.contains("est") {
-            "{\"time\": \"2026-04-21T10:32-04:00\", \"tz\": \"EDT\"}".to_string()
-        } else {
-            "{\"time\": \"2026-04-21T14:32+00:00\", \"tz\": \"UTC\"}".to_string()
-        }
+        Some(time_result(lc))
     } else {
-        format!("result({})", code)
+        None
+    }
+}
+
+fn weather_result(lc: &str) -> &'static str {
+    if lc.contains("london") {
+        r#"{"temp_f": 60, "sky": "cloudy"}"#
+    } else if lc.contains("paris") {
+        r#"{"temp_f": 59, "sky": "rainy"}"#
+    } else if lc.contains("boston") {
+        r#"{"temp_f": 68, "sky": "clear"}"#
+    } else if lc.contains("tokyo") {
+        r#"{"temp_f": 75, "sky": "humid"}"#
+    } else {
+        r#"{"temp_f": 72, "sky": "sunny"}"#
+    }
+}
+
+fn stock_result(lc: &str) -> &'static str {
+    if lc.contains("aapl") {
+        r#"{"ticker": "AAPL", "price_usd": 189.50}"#
+    } else if lc.contains("goog") {
+        r#"{"ticker": "GOOG", "price_usd": 141.20}"#
+    } else if lc.contains("tsla") {
+        r#"{"ticker": "TSLA", "price_usd": 258.30}"#
+    } else {
+        r#"{"ticker": "UNKNOWN", "price_usd": 100.00}"#
+    }
+}
+
+fn currency_result(lc: &str) -> &'static str {
+    if lc.contains("eur") {
+        r#"{"rate": 0.92, "quote": "USD->EUR"}"#
+    } else if lc.contains("jpy") {
+        r#"{"rate": 155.40, "quote": "USD->JPY"}"#
+    } else if lc.contains("gbp") {
+        r#"{"rate": 0.79, "quote": "USD->GBP"}"#
+    } else {
+        r#"{"rate": 1.00, "quote": "USD->USD"}"#
+    }
+}
+
+fn restaurants_result(lc: &str) -> &'static str {
+    if lc.contains("tokyo") {
+        r#"["Sukiyabashi Jiro", "Ichiran", "Sushi Saito"]"#
+    } else if lc.contains("paris") {
+        r#"["Le Jules Verne", "L'Ami Jean", "Septime"]"#
+    } else {
+        r#"["Katz's Deli", "Joe's Pizza", "Lombardi's"]"#
+    }
+}
+
+fn reviews_result(lc: &str) -> &'static str {
+    if lc.contains("katz") {
+        r#"{"stars": 4.6, "summary": "Iconic pastrami sandwiches"}"#
+    } else if lc.contains("jiro") {
+        r#"{"stars": 4.9, "summary": "Legendary omakase, tiny counter"}"#
+    } else if lc.contains("joe") {
+        r#"{"stars": 4.4, "summary": "Classic NY slice, cheap and fast"}"#
+    } else {
+        r#"{"stars": 4.0, "summary": "Solid, well-reviewed spot"}"#
+    }
+}
+
+fn time_result(lc: &str) -> &'static str {
+    if lc.contains("tokyo") || lc.contains("jst") {
+        r#"{"time": "2026-04-21T23:32+09:00", "tz": "JST"}"#
+    } else if lc.contains("london") || lc.contains("gmt") {
+        r#"{"time": "2026-04-21T15:32+01:00", "tz": "BST"}"#
+    } else if lc.contains("new_york") || lc.contains("nyc") || lc.contains("est") {
+        r#"{"time": "2026-04-21T10:32-04:00", "tz": "EDT"}"#
+    } else {
+        r#"{"time": "2026-04-21T14:32+00:00", "tz": "UTC"}"#
     }
 }
 
 /// A call that has been dispatched but not yet observed as complete.
-struct Pending {
+struct PendingCall {
     id: String,
     dispatched_at: Instant,
     fut: Pin<Box<dyn Future<Output = String>>>,
 }
 
 /// Poll a pending future once. Returns the result if ready.
-fn poll_once(p: &mut Pending) -> Option<String> {
+fn poll_once(p: &mut PendingCall) -> Option<String> {
     let waker = noop_waker();
     let mut cx = TaskContext::from_waker(&waker);
     match p.fut.as_mut().poll(&mut cx) {
         Poll::Ready(r) => Some(r),
         Poll::Pending => None,
     }
+}
+
+// ============================================================================
+// Main-loop helpers
+// ============================================================================
+
+fn intr_frame(id: &str, result: &str) -> String {
+    format!(" [INTR] {} [HEAD] {} [END] ", id, result)
+}
+
+/// Poll each pending call once. Completed calls are removed from `pending`
+/// and their result frames are pushed to `frames`. When `log_each_ready` is
+/// true, a per-completion log line is emitted (used by the per-decode-step
+/// drain; the TRAP-drain caller suppresses it and emits a single summary).
+fn poll_and_collect_ready(
+    pending: &mut Vec<PendingCall>,
+    frames: &mut Vec<String>,
+    log_each_ready: bool,
+) {
+    pending.retain_mut(|p| match poll_once(p) {
+        Some(result) => {
+            if log_each_ready {
+                println!(
+                    "[MinAsync] id={} ready after {}ms",
+                    p.id,
+                    p.dispatched_at.elapsed().as_millis()
+                );
+            }
+            frames.push(intr_frame(&p.id, &result));
+            false
+        }
+        None => true,
+    });
 }
 
 // ============================================================================
@@ -1034,7 +1065,7 @@ async fn main(input: Input) -> Result<String> {
     let suppress = SuppressMask::new(mask_size, &registry.suppressed);
     let stops = chat::stop_tokens(&model);
 
-    let mut g = ctx
+    let mut generator = ctx
         .generate(Sampler::TopP {
             temperature: input.temperature,
             p: input.top_p,
@@ -1047,20 +1078,29 @@ async fn main(input: Input) -> Result<String> {
     let mut generated: Vec<u32> = Vec::new();
 
     // In-flight async calls, and completed results awaiting injection.
-    let mut pending: Vec<Pending> = Vec::new();
+    let mut pending: Vec<PendingCall> = Vec::new();
     let mut ready_frames: Vec<String> = Vec::new();
-    let mut flush_injected_prefix = false;
+
+    // CUDA-driver workaround state: when we inject >1 token at TRAP, we
+    // accept all but the last this step, then the next step runs
+    // sampler-cleared (prefill-only) and finally accepts the deferred tail
+    // before resuming normal sampling. See asyncLM/CLAUDE.md for the
+    // motivation.
+    let mut next_step_flushes_injection = false;
     let mut deferred_injected_tail: Option<u32> = None;
 
     let mut step_count: usize = 0;
-    while let Some(mut step) = g.next()? {
+    while let Some(mut step) = generator.next()? {
         step_count += 1;
-        let flushing_injected_prefix = flush_injected_prefix;
-        if flushing_injected_prefix {
+
+        let is_flush_step = next_step_flushes_injection;
+        next_step_flushes_injection = false;
+        if is_flush_step {
             step.clear_sampler();
-            flush_injected_prefix = false;
         }
+
         let out = step.execute().await?;
+
         if DEBUG_TRACE {
             let dbg_tokens: Vec<String> = out
                 .tokens
@@ -1076,7 +1116,7 @@ async fn main(input: Input) -> Result<String> {
             );
         }
 
-        if flushing_injected_prefix {
+        if is_flush_step {
             if let Some(tail) = deferred_injected_tail.take() {
                 if DEBUG_TRACE {
                     println!(
@@ -1085,7 +1125,7 @@ async fn main(input: Input) -> Result<String> {
                         tokenizer.decode(&[tail]).unwrap_or_default()
                     );
                 }
-                let _ = g.accept(&[tail]);
+                let _ = generator.accept(&[tail]);
             }
             continue;
         }
@@ -1093,18 +1133,7 @@ async fn main(input: Input) -> Result<String> {
         // Advance each in-flight call by one poll — concurrent with token
         // generation. Core AsyncLM property: tool calls progress while
         // tokens are being sampled.
-        pending.retain_mut(|p| match poll_once(p) {
-            Some(result) => {
-                println!(
-                    "[MinAsync] id={} ready after {}ms",
-                    p.id,
-                    p.dispatched_at.elapsed().as_millis()
-                );
-                ready_frames.push(format!(" [INTR] {} [HEAD] {} [END] ", p.id, result));
-                false
-            }
-            None => true,
-        });
+        poll_and_collect_ready(&mut pending, &mut ready_frames, true);
 
         for &tok in &out.tokens {
             for event in parser.feed(tok, &tokenizer) {
@@ -1115,7 +1144,7 @@ async fn main(input: Input) -> Result<String> {
                             "[MinAsync] dispatching id={} code={} (fake_wait={}ms)",
                             id, code, input.fake_wait_ms
                         );
-                        pending.push(Pending {
+                        pending.push(PendingCall {
                             id: id.clone(),
                             dispatched_at: Instant::now(),
                             fut: Box::pin(execute_call(id, code, input.fake_wait_ms)),
@@ -1126,22 +1155,14 @@ async fn main(input: Input) -> Result<String> {
                         // completion before injection.
                         let trap_start = Instant::now();
                         while !pending.is_empty() {
-                            pending.retain_mut(|p| match poll_once(p) {
-                                Some(result) => {
-                                    ready_frames.push(format!(
-                                        " [INTR] {} [HEAD] {} [END] ",
-                                        p.id, result
-                                    ));
-                                    false
-                                }
-                                None => true,
-                            });
+                            poll_and_collect_ready(&mut pending, &mut ready_frames, false);
                         }
                         println!(
                             "[MinAsync] trap drained in {}ms; injecting {} frames",
                             trap_start.elapsed().as_millis(),
                             ready_frames.len()
                         );
+
                         // Bundle all ready frames into a single `accept`
                         // call. v1/v3 use this pattern; multiple consecutive
                         // accepts work in theory but the runtime behaves
@@ -1151,34 +1172,33 @@ async fn main(input: Input) -> Result<String> {
                             println!("[MinAsync] injecting: {}", frame.trim());
                             injected.extend(tokenizer.encode(&frame));
                         }
-                        if !injected.is_empty() {
+                        if injected.is_empty() {
+                            continue;
+                        }
+                        if DEBUG_TRACE {
+                            println!("[dbg] accept injecting {} tokens", injected.len());
+                        }
+                        if injected.len() > 1 {
+                            let tail = *injected.last().unwrap();
+                            let prefix_len = injected.len() - 1;
+                            let accepted = generator.accept(&injected[..prefix_len]);
                             if DEBUG_TRACE {
                                 println!(
-                                    "[dbg] accept injecting {} tokens",
-                                    injected.len()
+                                    "[dbg] accepted injected prefix {} tokens; deferring final token",
+                                    accepted.len()
                                 );
                             }
-                            if injected.len() > 1 {
-                                let tail = *injected.last().unwrap();
-                                let prefix_len = injected.len() - 1;
-                                let accepted = g.accept(&injected[..prefix_len]);
-                                if DEBUG_TRACE {
-                                    println!(
-                                        "[dbg] accepted injected prefix {} tokens; deferring final token",
-                                        accepted.len()
-                                    );
-                                }
-                                deferred_injected_tail = Some(tail);
-                                flush_injected_prefix = true;
-                            } else {
-                                let _ = g.accept(&injected);
-                            }
+                            deferred_injected_tail = Some(tail);
+                            next_step_flushes_injection = true;
+                        } else {
+                            let _ = generator.accept(&injected);
                         }
                     }
                 }
             }
         }
     }
+
     if DEBUG_TRACE {
         println!(
             "[dbg] loop exited after {} steps; generated.len={}; pending.len={}",
