@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["v1", "v2", "v3"]
+members = ["v1", "v2", "v3", "benchmarking/async", "benchmarking/parallel", "benchmarking/sync"]
 
 [profile.release]
 lto = true
