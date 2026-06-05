@@ -8,10 +8,13 @@
 //! `[TRAP][END]`, no checkpointing, no batching, no async polling.
 
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use inferlet::model::{Model, Tokenizer};
 use inferlet::sample::Sampler;
+use inferlet::serde_json::Value;
+use inferlet::wstd;
+use inferlet::wstd::http::{Client, Method, Request};
 use inferlet::{Constrain, Context, Generator, Result, chat, runtime};
 use serde::Deserialize;
 
@@ -32,8 +35,6 @@ struct Input {
     temperature: f32,
     #[serde(default = "default_top_p")]
     top_p: f32,
-    #[serde(default = "default_fake_wait_ms")]
-    fake_wait_ms: u64,
 }
 
 fn default_max_tokens() -> usize {
@@ -45,9 +46,6 @@ fn default_temperature() -> f32 {
 fn default_top_p() -> f32 {
     0.95
 }
-fn default_fake_wait_ms() -> u64 {
-    500
-}
 fn default_system() -> String {
     "You are an assistant that uses sequential, blocking function calls to\n\
      answer user questions.\n\
@@ -57,12 +55,11 @@ fn default_system() -> String {
      - Result (runtime-injected, you only read): [INTR] <id> [HEAD] <value> [END]\n\
      \n\
      Tools available:\n\
-     - get_weather(city: str) -> {\"temp_f\": int, \"sky\": str}\n\
+     - get_weather(city: str) -> {\"city\": str, \"temp_f\": int, \"sky\": str}\n\
      - get_stock_price(ticker: str) -> {\"ticker\": str, \"price_usd\": float}\n\
      - convert_currency(amount: float, from: str, to: str) -> {\"rate\": float, \"quote\": str}\n\
-     - search_restaurants(city: str) -> [str, ...]\n\
-     - get_reviews(name: str) -> {\"stars\": float, \"summary\": str}\n\
-     - get_time(timezone: str) -> {\"time\": str, \"tz\": str}\n\
+     - get_time(location: str) -> {\"time\": str, \"day\": str, \"tz\": str}\n\
+     - wiki_summary(title: str) -> {\"title\": str, \"summary\": str}\n\
      \n\
      Semantics:\n\
      - The runtime runs ONE [CALL] at a time. Generation BLOCKS at every\n\
@@ -73,6 +70,12 @@ fn default_system() -> String {
      - If part of the question is outside these tools (general knowledge,\n\
        math, unrelated topics), answer that part from your own knowledge\n\
        — do NOT invent a [CALL] for it.\n\
+     - Own-knowledge prose (background, comparisons, analysis) may appear\n\
+       ANYWHERE — before, between, or after [CALL]s. Only FETCHED values\n\
+       must wait for their [INTR] frame. If the user asks you to write\n\
+       prose FIRST and present fetched results after, make the [CALL]s\n\
+       first to retrieve the values, but ORDER your final answer exactly\n\
+       as the user requested (prose, then the fetched results).\n\
      - Do not put CML syntax inside <think> tags. Reason out what to call\n\
        briefly, exit </think>, THEN emit the actual [CALL] frame.\n\
      - Do not fabricate [INTR] frames yourself; the runtime produces them.\n\
@@ -100,7 +103,21 @@ fn default_system() -> String {
      User: What's the weather in Paris and what is the capital of Japan?\n\
      Assistant: [CALL] p1 [HEAD] get_weather(\"Paris\") [END]\n\
      [INTR] p1 [HEAD] {\"temp_f\": 59, \"sky\": \"rainy\"} [END]\n\
-     Paris is 59°F and rainy. The capital of Japan is Tokyo."
+     Paris is 59°F and rainy. The capital of Japan is Tokyo.\n\
+     \n\
+     Example 4 — user wants own-knowledge prose FIRST, fetched data after.\n\
+     Make the calls to retrieve the values, then write the answer in the\n\
+     requested order (prose first, fetched results last):\n\
+     User: Compare in two sentences why landmarks draw tourists (your own\n\
+     knowledge), then give the Wikipedia summary of the Eiffel Tower.\n\
+     Assistant: [CALL] e1 [HEAD] wiki_summary(\"Eiffel Tower\") [END]\n\
+     [INTR] e1 [HEAD] {\"summary\": \"The Eiffel Tower is a wrought-iron\n\
+     lattice tower on the Champ de Mars in Paris.\"} [END]\n\
+     Iconic landmarks draw tourists because they turn a city's identity\n\
+     into a single recognizable silhouette worth travelling for. Their\n\
+     scale and history make them shared reference points across cultures.\n\
+     Eiffel Tower: The Eiffel Tower is a wrought-iron lattice tower on the\n\
+     Champ de Mars in Paris."
         .to_string()
 }
 
@@ -735,111 +752,278 @@ impl Parser {
 }
 
 // ============================================================================
-// Synchronous tool dispatcher
+// Real tool executor (shared with v3 / async / parallel)
+//
+// Each CML call becomes a live HTTP GET via `wstd::http`. `execute_call` is an
+// async fn resolving to the `[INTR]` payload; the sync variant `await`s them
+// one at a time (see `run_sequential_batch`), so wall-clock is the sum of the
+// per-call latencies. Failures fold into `{"error": ...}`.
 // ============================================================================
 
-fn execute_call(id: &str, code: &str, wait_ms: u64) -> String {
+/// Resolve one CML call to its live API and return the `[INTR]` payload.
+async fn execute_call(id: String, code: String) -> String {
     let _ = id;
-    wait_blocking(wait_ms);
     let lc = code.to_lowercase();
-    canned_result(&lc)
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("result({})", code))
-}
-
-fn canned_result(lc: &str) -> Option<&'static str> {
-    if lc.contains("get_weather") || lc.contains("weather(") {
-        Some(weather_result(lc))
+    let result = if lc.contains("get_weather") || lc.contains("weather(") {
+        weather_call(&code).await
     } else if lc.contains("stock_price") || lc.contains("get_stock") {
-        Some(stock_result(lc))
+        stock_call(&code).await
     } else if lc.contains("convert_currency") || lc.contains("exchange_rate") {
-        Some(currency_result(lc))
-    } else if lc.contains("search_restaurants") || lc.contains("find_restaurants") {
-        Some(restaurants_result(lc))
-    } else if lc.contains("get_reviews") || lc.contains("reviews(") {
-        Some(reviews_result(lc))
+        currency_call(&code).await
     } else if lc.contains("get_time") || lc.contains("time_in") || lc.contains("current_time") {
-        Some(time_result(lc))
+        time_call(&code).await
+    } else if lc.contains("wiki_summary") || lc.contains("wikipedia") || lc.contains("wiki(") {
+        wiki_call(&code).await
     } else {
-        None
-    }
+        // Not one of the five live tools -> BFCL latency-emulated call.
+        bfcl_emulated_call(&code).await
+    };
+    result.unwrap_or_else(|e| format!("{{\"error\": {e:?}}}"))
 }
 
-fn weather_result(lc: &str) -> &'static str {
-    if lc.contains("london") {
-        r#"{"temp_f": 60, "sky": "cloudy"}"#
-    } else if lc.contains("paris") {
-        r#"{"temp_f": 59, "sky": "rainy"}"#
-    } else if lc.contains("boston") {
-        r#"{"temp_f": 68, "sky": "clear"}"#
-    } else if lc.contains("tokyo") {
-        r#"{"temp_f": 75, "sky": "humid"}"#
-    } else {
-        r#"{"temp_f": 72, "sky": "sunny"}"#
+/// BFCL latency-emulating fallback (paper §6 / arXiv:2412.07017).
+///
+/// BFCL functions (e.g. `spotify.play`, `math.pythagoras`) are not executable
+/// here; the paper assigns each function a 30-500 ms completion time and the
+/// executor just waits, then returns a result. We hash the function name to a
+/// stable latency in that range (reproducible, per-function differentiated),
+/// sleep on the wstd reactor so token decoding overlaps the wait (the core
+/// async-overlap property), and return a canned payload. Correctness is judged
+/// on the emitted `[CALL]` block, never on this result string.
+async fn bfcl_emulated_call(code: &str) -> std::result::Result<String, String> {
+    let name = code.split('(').next().unwrap_or(code).trim();
+    // FNV-1a over the function name -> latency in [30, 500] ms.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in name.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
     }
+    let latency_ms = 30 + (h % 471); // 30..=500
+    wstd::task::sleep(wstd::time::Duration::from_millis(latency_ms)).await;
+    Ok(format!(
+        "{{\"status\": \"ok\", \"function\": {name:?}, \"latency_ms\": {latency_ms}}}"
+    ))
 }
 
-fn stock_result(lc: &str) -> &'static str {
-    if lc.contains("aapl") {
-        r#"{"ticker": "AAPL", "price_usd": 189.50}"#
-    } else if lc.contains("goog") {
-        r#"{"ticker": "GOOG", "price_usd": 141.20}"#
-    } else if lc.contains("tsla") {
-        r#"{"ticker": "TSLA", "price_usd": 258.30}"#
-    } else {
-        r#"{"ticker": "UNKNOWN", "price_usd": 100.00}"#
+/// GET `url` and return the response body. Non-2xx and transport errors map
+/// to `Err`. A User-Agent is set because Wikipedia (and OSM) reject requests
+/// without one.
+async fn http_get(url: &str) -> std::result::Result<String, String> {
+    let client = Client::new();
+    let req = Request::builder()
+        .uri(url)
+        .method(Method::GET)
+        .header("user-agent", "pie-asynclm/0.1 (+https://pie-project.org)")
+        .body(wstd::io::empty())
+        .map_err(|e| format!("build request {url}: {e}"))?;
+    let resp = client
+        .send(req)
+        .await
+        .map_err(|e| format!("send {url}: {e}"))?;
+    let status = resp.status().as_u16();
+    let mut body = resp.into_body();
+    let bytes = body
+        .bytes()
+        .await
+        .map_err(|e| format!("read body {url}: {e}"))?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    if !(200..300).contains(&status) {
+        let snip: String = text.chars().take(120).collect();
+        return Err(format!("HTTP {status} from {url}: {snip}"));
     }
+    Ok(text)
 }
 
-fn currency_result(lc: &str) -> &'static str {
-    if lc.contains("eur") {
-        r#"{"rate": 0.92, "quote": "USD->EUR"}"#
-    } else if lc.contains("jpy") {
-        r#"{"rate": 155.40, "quote": "USD->JPY"}"#
-    } else if lc.contains("gbp") {
-        r#"{"rate": 0.79, "quote": "USD->GBP"}"#
-    } else {
-        r#"{"rate": 1.00, "quote": "USD->USD"}"#
+/// Percent-encode a path/query component (RFC 3986 unreserved set kept).
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
     }
+    out
 }
 
-fn restaurants_result(lc: &str) -> &'static str {
-    if lc.contains("tokyo") {
-        r#"["Sukiyabashi Jiro", "Ichiran", "Sushi Saito"]"#
-    } else if lc.contains("paris") {
-        r#"["Le Jules Verne", "L'Ami Jean", "Septime"]"#
-    } else {
-        r#"["Katz's Deli", "Joe's Pizza", "Lombardi's"]"#
+/// First argument of a call body like `get_weather("London")` or
+/// `get_time(Asia/Tokyo)` — prefers a quoted string, else the first
+/// comma-separated token inside the parentheses.
+fn first_arg(code: &str) -> Option<String> {
+    if let Some(q) = between(code, '"').or_else(|| between(code, '\'')) {
+        let q = q.trim();
+        if !q.is_empty() {
+            return Some(q.to_string());
+        }
     }
+    let inside = code.split_once('(')?.1;
+    let inside = inside.rsplit_once(')').map(|x| x.0).unwrap_or(inside);
+    let arg = inside
+        .split(',')
+        .next()?
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim();
+    (!arg.is_empty()).then(|| arg.to_string())
 }
 
-fn reviews_result(lc: &str) -> &'static str {
-    if lc.contains("katz") {
-        r#"{"stars": 4.6, "summary": "Iconic pastrami sandwiches"}"#
-    } else if lc.contains("jiro") {
-        r#"{"stars": 4.9, "summary": "Legendary omakase, tiny counter"}"#
-    } else if lc.contains("joe") {
-        r#"{"stars": 4.4, "summary": "Classic NY slice, cheap and fast"}"#
-    } else {
-        r#"{"stars": 4.0, "summary": "Solid, well-reviewed spot"}"#
-    }
+/// Text between the first matched pair of `delim`.
+fn between(s: &str, delim: char) -> Option<String> {
+    let start = s.find(delim)? + 1;
+    let rest = &s[start..];
+    let end = rest.find(delim)?;
+    Some(rest[..end].to_string())
 }
 
-fn time_result(lc: &str) -> &'static str {
-    if lc.contains("tokyo") || lc.contains("jst") {
-        r#"{"time": "2026-04-21T23:32+09:00", "tz": "JST"}"#
-    } else if lc.contains("london") || lc.contains("gmt") {
-        r#"{"time": "2026-04-21T15:32+01:00", "tz": "BST"}"#
-    } else if lc.contains("new_york") || lc.contains("nyc") || lc.contains("est") {
-        r#"{"time": "2026-04-21T10:32-04:00", "tz": "EDT"}"#
-    } else {
-        r#"{"time": "2026-04-21T14:32+00:00", "tz": "UTC"}"#
-    }
+/// get_weather(city) -> wttr.in current conditions.
+async fn weather_call(code: &str) -> std::result::Result<String, String> {
+    let city = first_arg(code).ok_or("get_weather: missing city")?;
+    let url = format!("https://wttr.in/{}?format=j1", urlencode(&city));
+    let body = http_get(&url).await?;
+    let v: Value =
+        inferlet::serde_json::from_str(&body).map_err(|e| format!("get_weather: bad JSON: {e}"))?;
+    let cur = v
+        .get("current_condition")
+        .and_then(|c| c.get(0))
+        .ok_or("get_weather: no current_condition")?;
+    let temp_f = cur.get("temp_F").and_then(Value::as_str).unwrap_or("0");
+    let sky = cur
+        .get("weatherDesc")
+        .and_then(|d| d.get(0))
+        .and_then(|d| d.get("value"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    Ok(format!(
+        "{{\"city\": {city:?}, \"temp_f\": {temp_f}, \"sky\": {sky:?}}}"
+    ))
 }
 
-fn wait_blocking(ms: u64) {
-    let deadline = Instant::now() + Duration::from_millis(ms);
-    while Instant::now() < deadline {}
+/// get_stock_price(ticker) -> stooq.com CSV last quote (US listing).
+async fn stock_call(code: &str) -> std::result::Result<String, String> {
+    let ticker = first_arg(code).ok_or("get_stock_price: missing ticker")?;
+    let url = format!(
+        "https://stooq.com/q/l/?s={}.us&f=sd2t2ohlcv&h&e=csv",
+        urlencode(&ticker.to_lowercase())
+    );
+    let body = http_get(&url).await?;
+    // CSV with header row: Symbol,Date,Time,Open,High,Low,Close,Volume
+    let data = body.lines().nth(1).unwrap_or("");
+    let cols: Vec<&str> = data.split(',').collect();
+    let close = cols.get(6).copied().filter(|c| !c.is_empty()).unwrap_or("");
+    if close.is_empty() || close == "N/D" {
+        return Err(format!("get_stock_price: no quote for {ticker}"));
+    }
+    Ok(format!(
+        "{{\"ticker\": {:?}, \"price_usd\": {close}}}",
+        ticker.to_uppercase()
+    ))
+}
+
+/// convert_currency(.., from, to) -> Frankfurter (ECB) reference rate.
+async fn currency_call(code: &str) -> std::result::Result<String, String> {
+    let codes = currency_codes(code);
+    let (from, to) = match codes.as_slice() {
+        [a, b, ..] => (a.clone(), b.clone()),
+        [a] => ("USD".to_string(), a.clone()),
+        _ => ("USD".to_string(), "EUR".to_string()),
+    };
+    let url = format!("https://api.frankfurter.dev/v1/latest?from={from}&to={to}");
+    let body = http_get(&url).await?;
+    let v: Value = inferlet::serde_json::from_str(&body)
+        .map_err(|e| format!("convert_currency: bad JSON: {e}"))?;
+    let rate = v
+        .get("rates")
+        .and_then(|r| r.get(&to))
+        .and_then(Value::as_f64)
+        .ok_or_else(|| format!("convert_currency: no {from}->{to} rate"))?;
+    Ok(format!("{{\"rate\": {rate}, \"quote\": \"{from}->{to}\"}}"))
+}
+
+/// 3-letter uppercase currency codes (e.g. USD, EUR) in order of appearance.
+fn currency_codes(code: &str) -> Vec<String> {
+    code.split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|t| t.len() == 3 && t.chars().all(|c| c.is_ascii_uppercase()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// get_time(location) -> timeapi.io current time for the resolved IANA zone.
+async fn time_call(code: &str) -> std::result::Result<String, String> {
+    let loc = first_arg(code).ok_or("get_time: missing location")?;
+    let tz = resolve_tz(&loc);
+    let url = format!(
+        "https://timeapi.io/api/Time/current/zone?timeZone={}",
+        urlencode(&tz)
+    );
+    let body = http_get(&url).await?;
+    let v: Value =
+        inferlet::serde_json::from_str(&body).map_err(|e| format!("get_time: bad JSON: {e}"))?;
+    let time = v.get("time").and_then(Value::as_str).unwrap_or("?");
+    let day = v.get("dayOfWeek").and_then(Value::as_str).unwrap_or("?");
+    Ok(format!(
+        "{{\"time\": {time:?}, \"day\": {day:?}, \"tz\": {tz:?}}}"
+    ))
+}
+
+/// Map a city/zone string to an IANA timezone. Passes through anything that
+/// already looks like a zone (`Region/City`); otherwise consults a small
+/// table of common benchmark cities, defaulting to UTC.
+fn resolve_tz(s: &str) -> String {
+    if s.contains('/') {
+        return s.to_string();
+    }
+    let tz = match s.to_lowercase().as_str() {
+        "tokyo" => "Asia/Tokyo",
+        "london" => "Europe/London",
+        "paris" => "Europe/Paris",
+        "berlin" => "Europe/Berlin",
+        "new york" | "nyc" | "new_york" => "America/New_York",
+        "boston" => "America/New_York",
+        "san francisco" | "sf" | "los angeles" | "la" => "America/Los_Angeles",
+        "chicago" => "America/Chicago",
+        "sydney" => "Australia/Sydney",
+        "singapore" => "Asia/Singapore",
+        "dubai" => "Asia/Dubai",
+        "utc" | "gmt" => "Etc/UTC",
+        _ => "Etc/UTC",
+    };
+    tz.to_string()
+}
+
+/// wiki_summary(title) -> Wikipedia REST summary extract (trimmed).
+async fn wiki_call(code: &str) -> std::result::Result<String, String> {
+    let title = first_arg(code).ok_or("wiki_summary: missing title")?;
+    let url = format!(
+        "https://en.wikipedia.org/api/rest_v1/page/summary/{}",
+        urlencode(&title.replace(' ', "_"))
+    );
+    let body = http_get(&url).await?;
+    let v: Value =
+        inferlet::serde_json::from_str(&body).map_err(|e| format!("wiki_summary: bad JSON: {e}"))?;
+    let extract = v.get("extract").and_then(Value::as_str).unwrap_or("");
+    if extract.is_empty() {
+        return Err(format!("wiki_summary: no summary for {title:?}"));
+    }
+    let summary = trim_summary(extract, 400);
+    Ok(format!("{{\"title\": {title:?}, \"summary\": {summary:?}}}"))
+}
+
+/// Trim `text` to at most `max_chars` characters without splitting a word:
+/// back off to the last whitespace inside the window and append an ellipsis.
+/// If the text already fits, it is returned unchanged.
+fn trim_summary(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut s: String = text.chars().take(max_chars).collect();
+    if let Some(idx) = s.rfind(char::is_whitespace) {
+        s.truncate(idx);
+    }
+    let mut s = s.trim_end().to_string();
+    s.push('…');
+    s
 }
 
 // ============================================================================
@@ -885,14 +1069,15 @@ fn stage_injection(
     }
 }
 
-/// Execute a sequential batch: each call sleeps its own `wait_ms` in turn,
-/// then synthesizes its result. Wall-clock cost is `Σ wait_i`. Returns the
-/// concatenated `[INTR]` frames ready for `stage_injection`.
-fn run_sequential_batch(batch: &[(String, String)], fake_wait_ms: u64) -> String {
+/// Execute a batch one call at a time: each call's real HTTP request must
+/// fully complete (`await`) before the next starts, so wall-clock cost is the
+/// sum of the per-call latencies. Returns the concatenated `[INTR]` frames
+/// ready for `stage_injection`.
+async fn run_sequential_batch(batch: &[(String, String)]) -> String {
     let mut frames = String::new();
     for (id, code) in batch {
         let start = Instant::now();
-        let result = execute_call(id, code, fake_wait_ms);
+        let result = execute_call(id.clone(), code.clone()).await;
         println!(
             "[SyncLM] id={} code={} ran in {}ms",
             id,
@@ -1005,7 +1190,7 @@ async fn main(input: Input) -> Result<String> {
         }
 
         if !batch.is_empty() {
-            let frames = run_sequential_batch(&batch, input.fake_wait_ms);
+            let frames = run_sequential_batch(&batch).await;
             stage_injection(
                 &mut generator,
                 &tokenizer,

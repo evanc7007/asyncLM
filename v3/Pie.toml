@@ -13,7 +13,6 @@ inputs = [
     { name = "max_tokens", type = "int", optional = true, description = "Maximum number of tokens to generate (default: 2048)" },
     { name = "temperature", type = "float", optional = true, description = "Sampling temperature (default: 0.6)" },
     { name = "top_p", type = "float", optional = true, description = "Top-p nucleus sampling threshold (default: 0.95)" },
-    { name = "fake_wait_ms", type = "int", optional = true, description = "Simulated async tool latency in milliseconds (default: 500)" },
     { name = "alpha_recompute_ns_per_tok2", type = "float", optional = true, description = "Recompute cost-model alpha in ns/token^2" },
     { name = "beta_swap_ns_per_tok", type = "float", optional = true, description = "Swap cost-model beta in ns/token" },
     { name = "enable_midstream", type = "bool", optional = true, description = "Enable safe-boundary mid-stream INTR injection" },

@@ -10,13 +10,16 @@
 //! execution collapses to Keep.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::{Future, poll_fn};
+use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use inferlet::model::{Model, Tokenizer};
 use inferlet::sample::Sampler;
+use inferlet::serde_json::Value;
+use inferlet::wstd;
+use inferlet::wstd::http::{Client, Method, Request};
 use inferlet::{Constrain, Context, Generator, Result, chat, runtime};
 use serde::Deserialize;
 
@@ -37,8 +40,6 @@ struct Input {
     temperature: f32,
     #[serde(default = "default_top_p")]
     top_p: f32,
-    #[serde(default = "default_fake_wait_ms")]
-    fake_wait_ms: u64,
     #[serde(default = "default_alpha")]
     alpha_recompute_ns_per_tok2: f64,
     #[serde(default = "default_beta")]
@@ -58,9 +59,6 @@ fn default_temperature() -> f32 {
 fn default_top_p() -> f32 {
     0.95
 }
-fn default_fake_wait_ms() -> u64 {
-    500
-}
 fn default_alpha() -> f64 {
     800.0
 }
@@ -76,13 +74,12 @@ fn default_system() -> String {
      - Wait for pending calls:  [TRAP][END]\n\
      - Result (runtime-injected, you only read): [INTR] <id> [HEAD] <value> [END]\n\
      \n\
-     Tools available:\n\
-     - get_weather(city: str) -> {\"temp_f\": int, \"sky\": str}\n\
+     Tools available (each backed by a live web API):\n\
+     - get_weather(city: str) -> {\"city\": str, \"temp_f\": int, \"sky\": str}\n\
      - get_stock_price(ticker: str) -> {\"ticker\": str, \"price_usd\": float}\n\
      - convert_currency(amount: float, from: str, to: str) -> {\"rate\": float, \"quote\": str}\n\
-     - search_restaurants(city: str) -> [str, ...]\n\
-     - get_reviews(name: str) -> {\"stars\": float, \"summary\": str}\n\
-     - get_time(timezone: str) -> {\"time\": str, \"tz\": str}\n\
+     - get_time(location: str) -> {\"time\": str, \"day\": str, \"tz\": str}\n\
+     - wiki_summary(title: str) -> {\"title\": str, \"summary\": str}\n\
      \n\
      Semantics:\n\
      - [CALL] blocks are non-blocking. Dispatch all independent calls\n\
@@ -877,12 +874,18 @@ impl Parser {
 }
 
 // ============================================================================
-// Async dummy executor
+// Real async executor
 //
-// `execute_call` yields `Poll::Pending` until a wall-clock deadline, then
-// returns a canned string. Hand-polled with a no-op waker once per main-loop
-// iteration so calls progress while tokens are being sampled — the core
-// AsyncLM property.
+// Each CML `[CALL]` becomes a live HTTP request via `wstd::http`, spawned onto
+// the wstd reactor at the dispatch site in `run_inner_session`. The reactor
+// advances in-flight requests every time the main loop awaits
+// `step.execute().await`, so tool calls genuinely overlap token decoding —
+// the core AsyncLM property, now with real tool latency instead of a
+// simulated wait.
+//
+// `execute_call` always resolves to a compact JSON string for the `[INTR]`
+// frame; any transport/parse failure is folded into an `{"error": ...}`
+// payload so the model still receives something it can read.
 // ============================================================================
 
 fn noop_waker() -> Waker {
@@ -895,143 +898,265 @@ fn noop_waker() -> Waker {
     unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
 }
 
-/// Yield `Poll::Pending` until `wait_ms` has elapsed. The cooperative
-/// `wake_by_ref` is what makes the hand-polled futures progress once per
-/// decode step.
-async fn wait_until_deadline(wait_ms: u64) {
-    let deadline = Instant::now() + Duration::from_millis(wait_ms);
-    poll_fn(|cx| {
-        if Instant::now() >= deadline {
-            Poll::Ready(())
-        } else {
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    })
-    .await;
-}
-
-async fn execute_call(id: String, code: String, wait_ms: u64) -> String {
-    wait_until_deadline(wait_ms).await;
+/// Resolve one CML call to its live API and return the `[INTR]` payload.
+async fn execute_call(id: String, code: String) -> String {
     let _ = id;
-    canned_result(&code.to_lowercase())
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("result({})", code))
-}
-
-/// Dispatch the lowercased call body to the right canned-result function.
-/// Returns `None` when no tool name matches; the caller falls back to
-/// `result(<code>)`.
-fn canned_result(lc: &str) -> Option<&'static str> {
-    if lc.contains("get_weather") || lc.contains("weather(") {
-        Some(weather_result(lc))
+    let lc = code.to_lowercase();
+    let result = if lc.contains("get_weather") || lc.contains("weather(") {
+        weather_call(&code).await
     } else if lc.contains("stock_price") || lc.contains("get_stock") {
-        Some(stock_result(lc))
+        stock_call(&code).await
     } else if lc.contains("convert_currency") || lc.contains("exchange_rate") {
-        Some(currency_result(lc))
-    } else if lc.contains("search_restaurants") || lc.contains("find_restaurants") {
-        Some(restaurants_result(lc))
-    } else if lc.contains("get_reviews") || lc.contains("reviews(") {
-        Some(reviews_result(lc))
+        currency_call(&code).await
     } else if lc.contains("get_time") || lc.contains("time_in") || lc.contains("current_time") {
-        Some(time_result(lc))
+        time_call(&code).await
+    } else if lc.contains("wiki_summary") || lc.contains("wikipedia") || lc.contains("wiki(") {
+        wiki_call(&code).await
     } else {
-        None
-    }
+        Err(format!("unknown tool in call body: {code}"))
+    };
+    result.unwrap_or_else(|e| format!("{{\"error\": {e:?}}}"))
 }
 
-fn weather_result(lc: &str) -> &'static str {
-    if lc.contains("london") {
-        r#"{"temp_f": 60, "sky": "cloudy"}"#
-    } else if lc.contains("paris") {
-        r#"{"temp_f": 59, "sky": "rainy"}"#
-    } else if lc.contains("boston") {
-        r#"{"temp_f": 68, "sky": "clear"}"#
-    } else if lc.contains("tokyo") {
-        r#"{"temp_f": 75, "sky": "humid"}"#
-    } else {
-        r#"{"temp_f": 72, "sky": "sunny"}"#
+/// GET `url` and return the response body. Non-2xx and transport errors map
+/// to `Err`. A User-Agent is set because Wikipedia (and OSM) reject requests
+/// without one.
+async fn http_get(url: &str) -> std::result::Result<String, String> {
+    let client = Client::new();
+    let req = Request::builder()
+        .uri(url)
+        .method(Method::GET)
+        .header("user-agent", "pie-asynclm/0.1 (+https://pie-project.org)")
+        .body(wstd::io::empty())
+        .map_err(|e| format!("build request {url}: {e}"))?;
+    let resp = client
+        .send(req)
+        .await
+        .map_err(|e| format!("send {url}: {e}"))?;
+    let status = resp.status().as_u16();
+    let mut body = resp.into_body();
+    let bytes = body
+        .bytes()
+        .await
+        .map_err(|e| format!("read body {url}: {e}"))?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    if !(200..300).contains(&status) {
+        let snip: String = text.chars().take(120).collect();
+        return Err(format!("HTTP {status} from {url}: {snip}"));
     }
+    Ok(text)
 }
 
-fn stock_result(lc: &str) -> &'static str {
-    if lc.contains("aapl") {
-        r#"{"ticker": "AAPL", "price_usd": 189.50}"#
-    } else if lc.contains("goog") {
-        r#"{"ticker": "GOOG", "price_usd": 141.20}"#
-    } else if lc.contains("tsla") {
-        r#"{"ticker": "TSLA", "price_usd": 258.30}"#
-    } else {
-        r#"{"ticker": "UNKNOWN", "price_usd": 100.00}"#
+/// Percent-encode a path/query component (RFC 3986 unreserved set kept).
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
     }
+    out
 }
 
-fn currency_result(lc: &str) -> &'static str {
-    if lc.contains("eur") {
-        r#"{"rate": 0.92, "quote": "USD->EUR"}"#
-    } else if lc.contains("jpy") {
-        r#"{"rate": 155.40, "quote": "USD->JPY"}"#
-    } else if lc.contains("gbp") {
-        r#"{"rate": 0.79, "quote": "USD->GBP"}"#
-    } else {
-        r#"{"rate": 1.00, "quote": "USD->USD"}"#
+/// First argument of a call body like `get_weather("London")` or
+/// `get_time(Asia/Tokyo)` — prefers a quoted string, else the first
+/// comma-separated token inside the parentheses.
+fn first_arg(code: &str) -> Option<String> {
+    if let Some(q) = between(code, '"').or_else(|| between(code, '\'')) {
+        let q = q.trim();
+        if !q.is_empty() {
+            return Some(q.to_string());
+        }
     }
+    let inside = code.split_once('(')?.1;
+    let inside = inside.rsplit_once(')').map(|x| x.0).unwrap_or(inside);
+    let arg = inside
+        .split(',')
+        .next()?
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim();
+    (!arg.is_empty()).then(|| arg.to_string())
 }
 
-fn restaurants_result(lc: &str) -> &'static str {
-    if lc.contains("tokyo") {
-        r#"["Sukiyabashi Jiro", "Ichiran", "Sushi Saito"]"#
-    } else if lc.contains("paris") {
-        r#"["Le Jules Verne", "L'Ami Jean", "Septime"]"#
-    } else {
-        r#"["Katz's Deli", "Joe's Pizza", "Lombardi's"]"#
-    }
+/// Text between the first matched pair of `delim`.
+fn between(s: &str, delim: char) -> Option<String> {
+    let start = s.find(delim)? + 1;
+    let rest = &s[start..];
+    let end = rest.find(delim)?;
+    Some(rest[..end].to_string())
 }
 
-fn reviews_result(lc: &str) -> &'static str {
-    if lc.contains("katz") {
-        r#"{"stars": 4.6, "summary": "Iconic pastrami sandwiches"}"#
-    } else if lc.contains("jiro") {
-        r#"{"stars": 4.9, "summary": "Legendary omakase, tiny counter"}"#
-    } else if lc.contains("joe") {
-        r#"{"stars": 4.4, "summary": "Classic NY slice, cheap and fast"}"#
-    } else {
-        r#"{"stars": 4.0, "summary": "Solid, well-reviewed spot"}"#
-    }
+/// get_weather(city) -> wttr.in current conditions.
+async fn weather_call(code: &str) -> std::result::Result<String, String> {
+    let city = first_arg(code).ok_or("get_weather: missing city")?;
+    let url = format!("https://wttr.in/{}?format=j1", urlencode(&city));
+    let body = http_get(&url).await?;
+    let v: Value =
+        inferlet::serde_json::from_str(&body).map_err(|e| format!("get_weather: bad JSON: {e}"))?;
+    let cur = v
+        .get("current_condition")
+        .and_then(|c| c.get(0))
+        .ok_or("get_weather: no current_condition")?;
+    let temp_f = cur.get("temp_F").and_then(Value::as_str).unwrap_or("0");
+    let sky = cur
+        .get("weatherDesc")
+        .and_then(|d| d.get(0))
+        .and_then(|d| d.get("value"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    Ok(format!(
+        "{{\"city\": {city:?}, \"temp_f\": {temp_f}, \"sky\": {sky:?}}}"
+    ))
 }
 
-fn time_result(lc: &str) -> &'static str {
-    if lc.contains("tokyo") || lc.contains("jst") {
-        r#"{"time": "2026-04-21T23:32+09:00", "tz": "JST"}"#
-    } else if lc.contains("london") || lc.contains("gmt") {
-        r#"{"time": "2026-04-21T15:32+01:00", "tz": "BST"}"#
-    } else if lc.contains("new_york") || lc.contains("nyc") || lc.contains("est") {
-        r#"{"time": "2026-04-21T10:32-04:00", "tz": "EDT"}"#
-    } else {
-        r#"{"time": "2026-04-21T14:32+00:00", "tz": "UTC"}"#
+/// get_stock_price(ticker) -> stooq.com CSV last quote (US listing).
+async fn stock_call(code: &str) -> std::result::Result<String, String> {
+    let ticker = first_arg(code).ok_or("get_stock_price: missing ticker")?;
+    let url = format!(
+        "https://stooq.com/q/l/?s={}.us&f=sd2t2ohlcv&h&e=csv",
+        urlencode(&ticker.to_lowercase())
+    );
+    let body = http_get(&url).await?;
+    // CSV with header row: Symbol,Date,Time,Open,High,Low,Close,Volume
+    let data = body.lines().nth(1).unwrap_or("");
+    let cols: Vec<&str> = data.split(',').collect();
+    let close = cols.get(6).copied().filter(|c| !c.is_empty()).unwrap_or("");
+    if close.is_empty() || close == "N/D" {
+        return Err(format!("get_stock_price: no quote for {ticker}"));
     }
+    Ok(format!(
+        "{{\"ticker\": {:?}, \"price_usd\": {close}}}",
+        ticker.to_uppercase()
+    ))
 }
 
-/// A call that has been dispatched but not yet observed as complete.
+/// convert_currency(.., from, to) -> Frankfurter (ECB) reference rate.
+async fn currency_call(code: &str) -> std::result::Result<String, String> {
+    let codes = currency_codes(code);
+    let (from, to) = match codes.as_slice() {
+        [a, b, ..] => (a.clone(), b.clone()),
+        [a] => ("USD".to_string(), a.clone()),
+        _ => ("USD".to_string(), "EUR".to_string()),
+    };
+    let url = format!("https://api.frankfurter.dev/v1/latest?from={from}&to={to}");
+    let body = http_get(&url).await?;
+    let v: Value = inferlet::serde_json::from_str(&body)
+        .map_err(|e| format!("convert_currency: bad JSON: {e}"))?;
+    let rate = v
+        .get("rates")
+        .and_then(|r| r.get(&to))
+        .and_then(Value::as_f64)
+        .ok_or_else(|| format!("convert_currency: no {from}->{to} rate"))?;
+    Ok(format!("{{\"rate\": {rate}, \"quote\": \"{from}->{to}\"}}"))
+}
+
+/// 3-letter uppercase currency codes (e.g. USD, EUR) in order of appearance.
+fn currency_codes(code: &str) -> Vec<String> {
+    code.split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|t| t.len() == 3 && t.chars().all(|c| c.is_ascii_uppercase()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// get_time(location) -> timeapi.io current time for the resolved IANA zone.
+async fn time_call(code: &str) -> std::result::Result<String, String> {
+    let loc = first_arg(code).ok_or("get_time: missing location")?;
+    let tz = resolve_tz(&loc);
+    let url = format!(
+        "https://timeapi.io/api/Time/current/zone?timeZone={}",
+        urlencode(&tz)
+    );
+    let body = http_get(&url).await?;
+    let v: Value =
+        inferlet::serde_json::from_str(&body).map_err(|e| format!("get_time: bad JSON: {e}"))?;
+    let time = v.get("time").and_then(Value::as_str).unwrap_or("?");
+    let day = v.get("dayOfWeek").and_then(Value::as_str).unwrap_or("?");
+    Ok(format!(
+        "{{\"time\": {time:?}, \"day\": {day:?}, \"tz\": {tz:?}}}"
+    ))
+}
+
+/// Map a city/zone string to an IANA timezone. Passes through anything that
+/// already looks like a zone (`Region/City`); otherwise consults a small
+/// table of common benchmark cities, defaulting to UTC.
+fn resolve_tz(s: &str) -> String {
+    if s.contains('/') {
+        return s.to_string();
+    }
+    let tz = match s.to_lowercase().as_str() {
+        "tokyo" => "Asia/Tokyo",
+        "london" => "Europe/London",
+        "paris" => "Europe/Paris",
+        "berlin" => "Europe/Berlin",
+        "new york" | "nyc" | "new_york" => "America/New_York",
+        "boston" => "America/New_York",
+        "san francisco" | "sf" | "los angeles" | "la" => "America/Los_Angeles",
+        "chicago" => "America/Chicago",
+        "sydney" => "Australia/Sydney",
+        "singapore" => "Asia/Singapore",
+        "dubai" => "Asia/Dubai",
+        "utc" | "gmt" => "Etc/UTC",
+        _ => "Etc/UTC",
+    };
+    tz.to_string()
+}
+
+/// wiki_summary(title) -> Wikipedia REST summary extract (trimmed).
+async fn wiki_call(code: &str) -> std::result::Result<String, String> {
+    let title = first_arg(code).ok_or("wiki_summary: missing title")?;
+    let url = format!(
+        "https://en.wikipedia.org/api/rest_v1/page/summary/{}",
+        urlencode(&title.replace(' ', "_"))
+    );
+    let body = http_get(&url).await?;
+    let v: Value =
+        inferlet::serde_json::from_str(&body).map_err(|e| format!("wiki_summary: bad JSON: {e}"))?;
+    let extract = v.get("extract").and_then(Value::as_str).unwrap_or("");
+    if extract.is_empty() {
+        return Err(format!("wiki_summary: no summary for {title:?}"));
+    }
+    let summary = trim_summary(extract, 400);
+    Ok(format!("{{\"title\": {title:?}, \"summary\": {summary:?}}}"))
+}
+
+/// Trim `text` to at most `max_chars` characters without splitting a word:
+/// back off to the last whitespace inside the window and append an ellipsis.
+/// If the text already fits, it is returned unchanged.
+fn trim_summary(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut s: String = text.chars().take(max_chars).collect();
+    if let Some(idx) = s.rfind(char::is_whitespace) {
+        s.truncate(idx);
+    }
+    let mut s = s.trim_end().to_string();
+    s.push('…');
+    s
+}
+
+/// A call dispatched as a `wstd` task. The fetch runs on the reactor; the
+/// loop harvests it once `is_finished()` flips true.
 struct PendingCall {
     id: String,
     dispatched_at: Instant,
-    wait_ms: u64,
-    fut: Pin<Box<dyn Future<Output = String>>>,
+    task: wstd::runtime::Task<String>,
 }
 
-impl PendingCall {
-    fn remaining_ms(&self) -> u64 {
-        let elapsed = self.dispatched_at.elapsed().as_millis() as u64;
-        self.wait_ms.saturating_sub(elapsed)
-    }
-}
-
-/// Poll a pending future once. Returns the result if ready.
+/// Harvest a finished call. Returns `None` while the task is still in flight —
+/// it makes progress on the reactor during the loop's `await`s, not here, so
+/// this never blocks and never spins a live request.
 fn poll_once(p: &mut PendingCall) -> Option<String> {
+    if !p.task.is_finished() {
+        return None;
+    }
     let waker = noop_waker();
     let mut cx = TaskContext::from_waker(&waker);
-    match p.fut.as_mut().poll(&mut cx) {
+    match Pin::new(&mut p.task).poll(&mut cx) {
         Poll::Ready(r) => Some(r),
         Poll::Pending => None,
     }
@@ -1293,15 +1418,12 @@ async fn run_inner_session(
                     Event::EnterCriticalSection => interrupts.set_critical(true),
                     Event::ExitCriticalSection => interrupts.set_critical(false),
                     Event::Call { id, code } => {
-                        println!(
-                            "[AsyncLM] dispatching id={} code={} (fake_wait={}ms)",
-                            id, code, input.fake_wait_ms
-                        );
+                        println!("[AsyncLM] dispatching id={id} code={code}");
+                        let task = wstd::runtime::spawn(execute_call(id.clone(), code));
                         pending.push(PendingCall {
-                            id: id.clone(),
+                            id,
                             dispatched_at: Instant::now(),
-                            wait_ms: input.fake_wait_ms,
-                            fut: Box::pin(execute_call(id, code, input.fake_wait_ms)),
+                            task,
                         });
                         interrupts.set_critical(false);
                         return Ok(Restart::Checkpoint);
@@ -1313,9 +1435,13 @@ async fn run_inner_session(
                             continue;
                         }
 
+                        let in_flight = pending.len();
+                        // No simulated wait any more: estimate the wait from
+                        // how long the longest still-in-flight call has
+                        // already been running.
                         let wait_ms = pending
                             .iter()
-                            .map(|p| p.remaining_ms() as f64)
+                            .map(|p| p.dispatched_at.elapsed().as_millis() as f64)
                             .fold(0.0f64, f64::max);
                         let checkpoint_available = checkpoint.latest.is_some();
                         let n = checkpoint
@@ -1324,17 +1450,35 @@ async fn run_inner_session(
                             .map(|cp| generated.len().saturating_sub(cp.tokens_generated_at))
                             .unwrap_or_else(|| generator.tokens_generated());
                         let (mut strategy, r_ms, s_ms) = classify_trap(n, wait_ms, cost);
-                        if !checkpoint_available || n == 0 {
+                        // Force Keep when nothing is genuinely left to wait
+                        // for: every call already completed during overlap, so
+                        // discarding those tokens (Recompute) would throw away
+                        // the win.
+                        if !checkpoint_available || n == 0 || in_flight == 0 {
                             strategy = TrapStrategy::Keep;
                         }
                         println!(
-                            "[AsyncLM] trap decision: {:?}  wait_t={:.1}ms r_ms={:.1}ms s_ms={:.1}ms n={}",
-                            strategy, wait_ms, r_ms, s_ms, n
+                            "[AsyncLM] trap decision: {:?}  wait_t={:.1}ms r_ms={:.1}ms s_ms={:.1}ms n={} in_flight={}",
+                            strategy, wait_ms, r_ms, s_ms, n, in_flight
                         );
 
                         let trap_start = Instant::now();
-                        while !pending.is_empty() {
-                            poll_and_collect_ready(pending, interrupts, true);
+                        // Block on the remaining in-flight calls. Awaiting the
+                        // task drives the reactor so the real fetch actually
+                        // completes here — polling alone would spin forever.
+                        for p in pending.drain(..) {
+                            let PendingCall {
+                                id,
+                                dispatched_at,
+                                task,
+                            } = p;
+                            let result = task.await;
+                            println!(
+                                "[AsyncLM] id={} ready after {}ms (trap-await)",
+                                id,
+                                dispatched_at.elapsed().as_millis()
+                            );
+                            interrupts.enqueue(&id, &result);
                         }
                         println!(
                             "[AsyncLM] trap drained in {}ms",
