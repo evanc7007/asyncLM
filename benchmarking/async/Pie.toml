@@ -1,6 +1,6 @@
 [package]
 name = "async-lm"
-version = "0.1.30"
+version = "0.1.33"
 description = "An inferlet implementing the logic of AsyncLM"
 
 [engine]
