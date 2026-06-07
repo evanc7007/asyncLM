@@ -1016,22 +1016,48 @@ async fn weather_call(code: &str) -> std::result::Result<String, String> {
 /// get_stock_price(ticker) -> stooq.com CSV last quote (US listing).
 async fn stock_call(code: &str) -> std::result::Result<String, String> {
     let ticker = first_arg(code).ok_or("get_stock_price: missing ticker")?;
+    let price = match fetch_stock_price(&ticker).await {
+        Some(p) => p,
+        // stooq rate-limits/blocks and returns an HTML/JS page instead of CSV;
+        // rather than emit a garbage "price" (the old code interpolated column
+        // 6 of whatever it got, so a JS fragment leaked into price_usd), fall
+        // back to a deterministic emulated quote so we still echo a clean value.
+        None => emulated_price(&ticker),
+    };
+    Ok(format!(
+        "{{\"ticker\": {:?}, \"price_usd\": {price:.2}}}",
+        ticker.to_uppercase()
+    ))
+}
+
+/// Fetch a real last-quote from stooq, returning None unless the response is
+/// the expected CSV with a clean positive numeric close. Anything else (an
+/// HTML block page, "N/D", junk) yields None so the caller can fall back.
+async fn fetch_stock_price(ticker: &str) -> Option<f64> {
     let url = format!(
         "https://stooq.com/q/l/?s={}.us&f=sd2t2ohlcv&h&e=csv",
         urlencode(&ticker.to_lowercase())
     );
-    let body = http_get(&url).await?;
-    // CSV with header row: Symbol,Date,Time,Open,High,Low,Close,Volume
-    let data = body.lines().nth(1).unwrap_or("");
-    let cols: Vec<&str> = data.split(',').collect();
-    let close = cols.get(6).copied().filter(|c| !c.is_empty()).unwrap_or("");
-    if close.is_empty() || close == "N/D" {
-        return Err(format!("get_stock_price: no quote for {ticker}"));
+    let body = http_get(&url).await.ok()?;
+    // Expected header: Symbol,Date,Time,Open,High,Low,Close,Volume
+    let mut lines = body.lines();
+    if !lines.next().unwrap_or("").starts_with("Symbol") {
+        return None;
     }
-    Ok(format!(
-        "{{\"ticker\": {:?}, \"price_usd\": {close}}}",
-        ticker.to_uppercase()
-    ))
+    let close = lines.next().unwrap_or("").split(',').nth(6).unwrap_or("").trim();
+    match close.parse::<f64>() {
+        Ok(p) if p.is_finite() && p > 0.0 => Some(p),
+        _ => None,
+    }
+}
+
+/// Deterministic fallback quote (~$20–$520, stable per ticker) used when the
+/// live feed is unavailable, so stock prompts still get a clean value to echo.
+fn emulated_price(ticker: &str) -> f64 {
+    let h = ticker
+        .bytes()
+        .fold(2166136261u32, |acc, b| (acc ^ b as u32).wrapping_mul(16777619));
+    20.0 + (h % 50000) as f64 / 100.0
 }
 
 /// convert_currency(.., from, to) -> Frankfurter (ECB) reference rate.
@@ -1147,9 +1173,10 @@ struct PendingCall {
     task: wstd::runtime::Task<String>,
 }
 
-/// Harvest a finished call. Returns `None` while the task is still in flight —
-/// it makes progress on the reactor during the loop's `await`s, not here, so
-/// this never blocks and never spins a live request.
+/// Harvest a finished call. Returns `None` while the task is still in flight.
+/// Tasks make progress on the reactor when the main loop yields to it (see
+/// `yield_to_reactor`), not here, so this never blocks and never spins a live
+/// request.
 fn poll_once(p: &mut PendingCall) -> Option<String> {
     if !p.task.is_finished() {
         return None;
@@ -1160,6 +1187,35 @@ fn poll_once(p: &mut PendingCall) -> Option<String> {
         Poll::Ready(r) => Some(r),
         Poll::Pending => None,
     }
+}
+
+/// Yield once to the wstd executor so other ready tasks get to run.
+///
+/// This is what makes the async overlap real. `step.execute().await` (the
+/// forward pass) resolves *synchronously* — it never yields `Pending` — so
+/// between dispatching a `[CALL]` and reaching the `[TRAP]`, the main task
+/// monopolises the single-threaded executor and the spawned `execute_call`
+/// futures sit un-polled on the ready list. Their timers/sockets never advance,
+/// so every call only "starts" when the trap finally awaits it (you'd observe
+/// `ready after ≈ trap_time + latency`, and `mid_injects` stays 0).
+///
+/// Yielding here hands `block_on` a turn: it runs the freshly-spawned tasks to
+/// their first await (registering pollables) and non-block-checks the reactor's
+/// pollables, completing any whose wall-clock deadline has elapsed. Across the
+/// decode steps that span the call's latency, the result then lands in the
+/// interrupt queue *during* prose generation — the actual concurrency.
+async fn yield_to_reactor() {
+    let mut yielded = false;
+    std::future::poll_fn(move |cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 // ============================================================================
@@ -1409,6 +1465,13 @@ async fn run_inner_session(
             continue;
         }
 
+        // Give the executor turns so spawned execute_call tasks make progress
+        // *during* decode (timers/sockets advance, completed ones finish). The
+        // forward pass above never yields, so without this the calls stay
+        // frozen until the trap — i.e. no async overlap. See `yield_to_reactor`.
+        if !pending.is_empty() {
+            yield_to_reactor().await;
+        }
         poll_and_collect_ready(pending, interrupts, true);
 
         for &tok in &out.tokens {

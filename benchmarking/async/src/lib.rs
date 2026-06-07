@@ -1200,9 +1200,10 @@ struct PendingCall {
     task: wstd::runtime::Task<String>,
 }
 
-/// Harvest a finished call. Returns `None` while the task is still in flight —
-/// it makes progress on the reactor during the loop's `await`s, not here, so
-/// this never blocks and never spins a live request.
+/// Harvest a finished call. Returns `None` while the task is still in flight.
+/// Tasks make progress on the reactor when the main loop yields to it (see
+/// `yield_to_reactor`), not here, so this never blocks and never spins a live
+/// request.
 fn poll_once(p: &mut PendingCall) -> Option<String> {
     if !p.task.is_finished() {
         return None;
@@ -1213,6 +1214,35 @@ fn poll_once(p: &mut PendingCall) -> Option<String> {
         Poll::Ready(r) => Some(r),
         Poll::Pending => None,
     }
+}
+
+/// Yield once to the wstd executor so other ready tasks get to run.
+///
+/// This is what makes the async overlap real. `step.execute().await` (the
+/// forward pass) resolves *synchronously* — it never yields `Pending` — so
+/// between dispatching a `[CALL]` and reaching the `[TRAP]`, the main task
+/// monopolises the single-threaded executor and the spawned `execute_call`
+/// futures sit un-polled on the ready list. Their timers/sockets never advance,
+/// so every call only "starts" when the trap finally awaits it (you'd observe
+/// `ready after ≈ trap_time + latency`, and `mid_injects` stays 0).
+///
+/// Yielding here hands `block_on` a turn: it runs the freshly-spawned tasks to
+/// their first await (registering pollables) and non-block-checks the reactor's
+/// pollables, completing any whose wall-clock deadline has elapsed. Across the
+/// decode steps that span the call's latency, the result then lands in the
+/// interrupt queue *during* prose generation — the actual concurrency.
+async fn yield_to_reactor() {
+    let mut yielded = false;
+    std::future::poll_fn(move |cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 // ============================================================================
@@ -1462,6 +1492,13 @@ async fn run_inner_session(
             continue;
         }
 
+        // Give the executor turns so spawned execute_call tasks make progress
+        // *during* decode (timers/sockets advance, completed ones finish). The
+        // forward pass above never yields, so without this the calls stay
+        // frozen until the trap — i.e. no async overlap. See `yield_to_reactor`.
+        if !pending.is_empty() {
+            yield_to_reactor().await;
+        }
         poll_and_collect_ready(pending, interrupts, true);
 
         for &tok in &out.tokens {
