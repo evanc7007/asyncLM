@@ -103,31 +103,43 @@ fn default_system() -> String {
      - Do not put CML syntax inside <think> tags. Reason out what to call\n\
        briefly, exit </think>, THEN emit the actual [CALL] frame.\n\
      - Do not fabricate [INTR] frames yourself; the runtime produces them.\n\
+     - NEVER write, repeat, paraphrase, or echo an [INTR] frame or any part\n\
+       of it (the literal [INTR] / [HEAD] / [END] markers, the id, or the\n\
+       JSON value). Each result is already injected into your context — just\n\
+       READ it and answer in prose. The [INTR] lines shown in the examples\n\
+       below are RUNTIME-INJECTED for illustration; they are NOT text you\n\
+       produce. After a [CALL]'s [INTR] arrives, your output is prose or the\n\
+       next [CALL] frame.\n\
      - Never put plain prose or explanations inside [CALL]; [CALL] bodies must be one of the listed tool functions.\n\
      \n\
      Example 1 — two sequential calls:\n\
      User: What's the weather in NYC and London?\n\
      Assistant: [CALL] w1 [HEAD] get_weather(\"New York\") [END]\n\
+     ‹runtime injects the next line — you READ it, never write it›\n\
      [INTR] w1 [HEAD] {\"temp_f\": 72, \"sky\": \"sunny\"} [END]\n\
-     [CALL] w2 [HEAD] get_weather(\"London\") [END]\n\
+     ‹you resume› [CALL] w2 [HEAD] get_weather(\"London\") [END]\n\
+     ‹runtime injects the next line — you READ it, never write it›\n\
      [INTR] w2 [HEAD] {\"temp_f\": 60, \"sky\": \"cloudy\"} [END]\n\
-     NYC is 72°F and sunny; London is 60°F and cloudy.\n\
+     ‹you resume, prose only› NYC is 72°F and sunny; London is 60°F and cloudy.\n\
      \n\
      Example 2 — dependent call:\n\
      User: Get the weather in Boston, then also get the weather for a\n\
      city whose name is that temperature (as a string).\n\
      Assistant: [CALL] b1 [HEAD] get_weather(\"Boston\") [END]\n\
+     ‹runtime injects the next line — you READ it, never write it›\n\
      [INTR] b1 [HEAD] {\"temp_f\": 68, \"sky\": \"clear\"} [END]\n\
-     Boston is 68°F. Now looking up \"68\".\n\
+     ‹you resume, prose only› Boston is 68°F. Now looking up \"68\".\n\
      [CALL] b2 [HEAD] get_weather(\"68\") [END]\n\
+     ‹runtime injects the next line — you READ it, never write it›\n\
      [INTR] b2 [HEAD] {\"temp_f\": 72, \"sky\": \"sunny\"} [END]\n\
-     Boston is 68°F and clear; \"68\" is 72°F and sunny.\n\
+     ‹you resume, prose only› Boston is 68°F and clear; \"68\" is 72°F and sunny.\n\
      \n\
      Example 3 — mixed tool + knowledge question:\n\
      User: What's the weather in Paris and what is the capital of Japan?\n\
      Assistant: [CALL] p1 [HEAD] get_weather(\"Paris\") [END]\n\
+     ‹runtime injects the next line — you READ it, never write it›\n\
      [INTR] p1 [HEAD] {\"temp_f\": 59, \"sky\": \"rainy\"} [END]\n\
-     Paris is 59°F and rainy. The capital of Japan is Tokyo.\n\
+     ‹you resume, prose only› Paris is 59°F and rainy. The capital of Japan is Tokyo.\n\
      \n\
      Example 4 — user wants own-knowledge prose FIRST, fetched data after.\n\
      Make the calls to retrieve the values, then write the answer in the\n\
@@ -135,13 +147,26 @@ fn default_system() -> String {
      User: Compare in two sentences why landmarks draw tourists (your own\n\
      knowledge), then give the Wikipedia summary of the Eiffel Tower.\n\
      Assistant: [CALL] e1 [HEAD] wiki_summary(\"Eiffel Tower\") [END]\n\
+     ‹runtime injects the next two lines — you READ them, never write them›\n\
      [INTR] e1 [HEAD] {\"summary\": \"The Eiffel Tower is a wrought-iron\n\
      lattice tower on the Champ de Mars in Paris.\"} [END]\n\
-     Iconic landmarks draw tourists because they turn a city's identity\n\
-     into a single recognizable silhouette worth travelling for. Their\n\
-     scale and history make them shared reference points across cultures.\n\
-     Eiffel Tower: The Eiffel Tower is a wrought-iron lattice tower on the\n\
-     Champ de Mars in Paris."
+     ‹you resume, prose only› Iconic landmarks draw tourists because they\n\
+     turn a city's identity into a single recognizable silhouette worth\n\
+     travelling for. Their scale and history make them shared reference\n\
+     points across cultures. Eiffel Tower: The Eiffel Tower is a\n\
+     wrought-iron lattice tower on the Champ de Mars in Paris.\n\
+     \n\
+     Example 5 — fetched price converted into another currency (sequential,\n\
+     round 2 depends on round 1):\n\
+     User: What is the price of AAPL in euros?\n\
+     Assistant: [CALL] s1 [HEAD] get_stock_price(\"AAPL\") [END]\n\
+     ‹runtime injects the next line — you READ it, never write it›\n\
+     [INTR] s1 [HEAD] {\"ticker\": \"AAPL\", \"price_usd\": 231.20} [END]\n\
+     ‹you resume, prose only› AAPL is $231.20; converting that to euros.\n\
+     [CALL] c1 [HEAD] convert_currency(231.20, \"USD\", \"EUR\") [END]\n\
+     ‹runtime injects the next line — you READ it, never write it›\n\
+     [INTR] c1 [HEAD] {\"rate\": 0.92, \"quote\": \"212.70 EUR\"} [END]\n\
+     ‹you resume, prose only› AAPL is $231.20, about 212.70 EUR at a 0.92 USD→EUR rate."
         .to_string()
 }
 

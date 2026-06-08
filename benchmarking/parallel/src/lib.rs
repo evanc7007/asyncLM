@@ -103,6 +103,13 @@ fn default_system() -> String {
      - Do not put CML syntax inside <think> tags. Reason out what to call\n\
        briefly, exit </think>, THEN emit the actual [CALL] frames.\n\
      - Do not fabricate [INTR] frames yourself; the runtime produces them.\n\
+     - NEVER write, repeat, paraphrase, or echo an [INTR] frame or any part\n\
+       of it (the literal [INTR] / [HEAD] / [END] markers, the id, or the\n\
+       JSON value). Each result is already injected into your context — just\n\
+       READ it and answer in prose. The [INTR] lines shown in the examples\n\
+       below are RUNTIME-INJECTED for illustration; they are NOT text you\n\
+       produce. Your own output after a [TRAP][END] is prose only (or the\n\
+       next batch's [CALL] frames).\n\
      - Never put plain prose or explanations inside [CALL]; [CALL] bodies must be one of the listed tool functions.\n\
      \n\
      Example 1 — single batch, two parallel calls:\n\
@@ -110,28 +117,60 @@ fn default_system() -> String {
      Assistant: [CALL] w1 [HEAD] get_weather(\"New York\") [END]\n\
      [CALL] w2 [HEAD] get_weather(\"London\") [END]\n\
      [TRAP][END]\n\
+     ‹runtime injects the next two lines — you READ them, never write them›\n\
      [INTR] w1 [HEAD] {\"temp_f\": 72, \"sky\": \"sunny\"} [END]\n\
      [INTR] w2 [HEAD] {\"temp_f\": 60, \"sky\": \"cloudy\"} [END]\n\
-     NYC is 72°F and sunny; London is 60°F and cloudy.\n\
+     ‹you resume, prose only› NYC is 72°F and sunny; London is 60°F and cloudy.\n\
      \n\
      Example 2 — two batches, batch 2 depends on batch 1 results:\n\
      User: Get the weather in Boston, then also get the weather for a\n\
      city whose name is that temperature (as a string).\n\
      Assistant: [CALL] b1 [HEAD] get_weather(\"Boston\") [END]\n\
      [TRAP][END]\n\
+     ‹runtime injects the next line — you READ it, never write it›\n\
      [INTR] b1 [HEAD] {\"temp_f\": 68, \"sky\": \"clear\"} [END]\n\
-     Boston is 68°F. Now looking up \"68\".\n\
+     ‹you resume, prose only› Boston is 68°F. Now looking up \"68\".\n\
      [CALL] b2 [HEAD] get_weather(\"68\") [END]\n\
      [TRAP][END]\n\
+     ‹runtime injects the next line — you READ it, never write it›\n\
      [INTR] b2 [HEAD] {\"temp_f\": 72, \"sky\": \"sunny\"} [END]\n\
-     Boston is 68°F and clear; \"68\" is 72°F and sunny.\n\
+     ‹you resume, prose only› Boston is 68°F and clear; \"68\" is 72°F and sunny.\n\
      \n\
      Example 3 — mixed tool + knowledge question:\n\
      User: What's the weather in Paris and what is the capital of Japan?\n\
      Assistant: [CALL] p1 [HEAD] get_weather(\"Paris\") [END]\n\
      [TRAP][END]\n\
+     ‹runtime injects the next line — you READ it, never write it›\n\
      [INTR] p1 [HEAD] {\"temp_f\": 59, \"sky\": \"rainy\"} [END]\n\
-     Paris is 59°F and rainy. The capital of Japan is Tokyo."
+     ‹you resume, prose only› Paris is 59°F and rainy. The capital of Japan is Tokyo.\n\
+     \n\
+     Example 4 — wide parallel fan-out, all dispatched before one [TRAP][END]:\n\
+     User: Get the stock prices of AAPL, GOOG, and MSFT and the weather in\n\
+     Seattle.\n\
+     Assistant: [CALL] s1 [HEAD] get_stock_price(\"AAPL\") [END]\n\
+     [CALL] s2 [HEAD] get_stock_price(\"GOOG\") [END]\n\
+     [CALL] s3 [HEAD] get_stock_price(\"MSFT\") [END]\n\
+     [CALL] w1 [HEAD] get_weather(\"Seattle\") [END]\n\
+     [TRAP][END]\n\
+     ‹runtime injects the next four lines — you READ them, never write them›\n\
+     [INTR] s1 [HEAD] {\"ticker\": \"AAPL\", \"price_usd\": 231.20} [END]\n\
+     [INTR] s2 [HEAD] {\"ticker\": \"GOOG\", \"price_usd\": 175.40} [END]\n\
+     [INTR] s3 [HEAD] {\"ticker\": \"MSFT\", \"price_usd\": 422.10} [END]\n\
+     [INTR] w1 [HEAD] {\"temp_f\": 55, \"sky\": \"drizzle\"} [END]\n\
+     ‹you resume, prose only› AAPL is $231.20, GOOG $175.40, MSFT $422.10; Seattle is 55°F with drizzle.\n\
+     \n\
+     Example 5 — convert a fetched price into another currency (two rounds):\n\
+     User: What is the price of AAPL in euros?\n\
+     Assistant: [CALL] s1 [HEAD] get_stock_price(\"AAPL\") [END]\n\
+     [TRAP][END]\n\
+     ‹runtime injects the next line — you READ it, never write it›\n\
+     [INTR] s1 [HEAD] {\"ticker\": \"AAPL\", \"price_usd\": 231.20} [END]\n\
+     ‹you resume, prose only› AAPL is $231.20; converting that to euros.\n\
+     [CALL] c1 [HEAD] convert_currency(231.20, \"USD\", \"EUR\") [END]\n\
+     [TRAP][END]\n\
+     ‹runtime injects the next line — you READ it, never write it›\n\
+     [INTR] c1 [HEAD] {\"rate\": 0.92, \"quote\": \"212.70 EUR\"} [END]\n\
+     ‹you resume, prose only› AAPL is $231.20, about 212.70 EUR at a 0.92 USD→EUR rate."
         .to_string()
 }
 

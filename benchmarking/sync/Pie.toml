@@ -1,6 +1,6 @@
 [package]
 name = "sync-lm"
-version = "0.1.5"
+version = "0.1.6"
 description = "Blocking sequential tool calling baseline"
 
 [engine]
