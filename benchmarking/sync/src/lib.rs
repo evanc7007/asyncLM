@@ -8,6 +8,7 @@
 //! `[TRAP][END]`, no checkpointing, no batching, no async polling.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use inferlet::model::{Model, Tokenizer};
@@ -19,6 +20,29 @@ use inferlet::{Constrain, Context, Generator, Result, chat, runtime};
 use serde::Deserialize;
 
 const DEBUG_TRACE: bool = false;
+
+// ── Trace instrumentation ───────────────────────────────────────────────────
+// One machine-readable line per event with an absolute elapsed-ms timestamp,
+// consumed by benchmarking/{trace_extract,viz_timeline}.py. Existing [SyncLM]
+// prints are left untouched. Absent numeric fields are -1.
+//   schema: [TRACE] v=<variant> t=<ms> kind=<k> id=<id> dur=<ms> tok=<n> sub=<s>
+const TRACE_V: &str = "sync";
+static TRACE_T0: OnceLock<Instant> = OnceLock::new();
+fn t_ms() -> u128 {
+    TRACE_T0.get_or_init(Instant::now).elapsed().as_millis()
+}
+fn trace(kind: &str, id: &str, dur: i64, tok: i64, sub: &str) {
+    println!(
+        "[TRACE] v={} t={} kind={} id={} dur={} tok={} sub={}",
+        TRACE_V,
+        t_ms(),
+        kind,
+        id,
+        dur,
+        tok,
+        sub
+    );
+}
 
 // ============================================================================
 // Input
@@ -1102,6 +1126,8 @@ fn stage_injection(
 /// sum of the per-call latencies. Returns the concatenated `[INTR]` frames
 /// ready for `stage_injection`.
 async fn run_sequential_batch(batch: &[(String, String)]) -> String {
+    let batch_start = Instant::now();
+    trace("trap_start", "", -1, batch.len() as i64, "seq");
     let mut frames = String::new();
     for (id, code) in batch {
         let start = Instant::now();
@@ -1112,8 +1138,11 @@ async fn run_sequential_batch(batch: &[(String, String)]) -> String {
             code,
             start.elapsed().as_millis()
         );
+        trace("ready", id, start.elapsed().as_millis() as i64, -1, "seq");
+        trace("inject", id, -1, -1, "seq");
         frames.push_str(&intr_frame(id, &result));
     }
+    trace("trap_end", "", batch_start.elapsed().as_millis() as i64, batch.len() as i64, "");
     frames
 }
 
@@ -1139,6 +1168,7 @@ async fn main(input: Input) -> Result<String> {
         registry.trap_ids,
         registry.intr_ids
     );
+    trace("run_start", "", -1, -1, "");
 
     let (sp_ids, _) = tokenizer.special_tokens();
     let vocab_size = tokenizer.vocabs().0.len() as u32;
@@ -1168,8 +1198,13 @@ async fn main(input: Input) -> Result<String> {
     let mut generated: Vec<u32> = Vec::new();
     let mut next_step_flushes_injection = false;
     let mut deferred_injected_tail: Option<u32> = None;
+    let mut step_count: usize = 0;
 
     while let Some(mut step) = generator.next()? {
+        step_count += 1;
+        if step_count % 8 == 0 {
+            trace("decode_step", "", -1, step_count as i64, "");
+        }
         let is_flush_step = next_step_flushes_injection;
         next_step_flushes_injection = false;
         if is_flush_step {
@@ -1211,7 +1246,10 @@ async fn main(input: Input) -> Result<String> {
             for event in parser.feed(tok, &tokenizer) {
                 match event {
                     Event::Passthrough(t) => generated.push(t),
-                    Event::Call { id, code } => batch.push((id, code)),
+                    Event::Call { id, code } => {
+                        trace("dispatch", &id, -1, generated.len() as i64, "");
+                        batch.push((id, code));
+                    }
                     Event::Trap => { /* no-op in sync mode */ }
                 }
             }
@@ -1235,5 +1273,6 @@ async fn main(input: Input) -> Result<String> {
         }
     }
 
+    trace("run_end", "", t_ms() as i64, generated.len() as i64, "");
     Ok(tokenizer.decode(&generated).unwrap_or_default())
 }

@@ -8,6 +8,7 @@
 //! mid-stream injection, no `Future`/`poll_fn` plumbing.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use inferlet::model::{Model, Tokenizer};
@@ -19,6 +20,29 @@ use inferlet::{Constrain, Context, Generator, Result, chat, runtime};
 use serde::Deserialize;
 
 const DEBUG_TRACE: bool = false;
+
+// ── Trace instrumentation ───────────────────────────────────────────────────
+// One machine-readable line per event with an absolute elapsed-ms timestamp,
+// consumed by benchmarking/{trace_extract,viz_timeline}.py. Existing
+// [ParallelLM] prints are left untouched. Absent numeric fields are -1.
+//   schema: [TRACE] v=<variant> t=<ms> kind=<k> id=<id> dur=<ms> tok=<n> sub=<s>
+const TRACE_V: &str = "parallel";
+static TRACE_T0: OnceLock<Instant> = OnceLock::new();
+fn t_ms() -> u128 {
+    TRACE_T0.get_or_init(Instant::now).elapsed().as_millis()
+}
+fn trace(kind: &str, id: &str, dur: i64, tok: i64, sub: &str) {
+    println!(
+        "[TRACE] v={} t={} kind={} id={} dur={} tok={} sub={}",
+        TRACE_V,
+        t_ms(),
+        kind,
+        id,
+        dur,
+        tok,
+        sub
+    );
+}
 
 // ============================================================================
 // Input
@@ -1094,6 +1118,7 @@ fn stage_injection(
 /// blocked here at the trap). Returns the concatenated `[INTR]` frame text.
 async fn drain_pending_on_trap(pending: &[(String, String)]) -> String {
     let batch_start = Instant::now();
+    trace("trap_start", "", -1, pending.len() as i64, "batch");
     // Spawn everything first; the reactor advances all of them during the
     // awaits below, so harvesting in order still costs only max(latency_i).
     let tasks: Vec<wstd::runtime::Task<String>> = pending
@@ -1110,6 +1135,8 @@ async fn drain_pending_on_trap(pending: &[(String, String)]) -> String {
             code,
             batch_start.elapsed().as_millis()
         );
+        trace("ready", id, batch_start.elapsed().as_millis() as i64, -1, "batch");
+        trace("inject", id, -1, -1, "trap");
         frames.push_str(&intr_frame(id, &result));
     }
     println!(
@@ -1117,6 +1144,7 @@ async fn drain_pending_on_trap(pending: &[(String, String)]) -> String {
         pending.len(),
         batch_start.elapsed().as_millis()
     );
+    trace("trap_end", "", batch_start.elapsed().as_millis() as i64, pending.len() as i64, "");
     frames
 }
 
@@ -1142,6 +1170,7 @@ async fn main(input: Input) -> Result<String> {
         registry.trap_ids,
         registry.intr_ids
     );
+    trace("run_start", "", -1, -1, "");
 
     let (sp_ids, _) = tokenizer.special_tokens();
     let vocab_size = tokenizer.vocabs().0.len() as u32;
@@ -1175,8 +1204,13 @@ async fn main(input: Input) -> Result<String> {
     // [TRAP][END]. Decode keeps running while the queue grows — the
     // wait is paid once on TRAP, not on each [CALL].
     let mut pending: Vec<(String, String)> = Vec::new();
+    let mut step_count: usize = 0;
 
     while let Some(mut step) = generator.next()? {
+        step_count += 1;
+        if step_count % 8 == 0 {
+            trace("decode_step", "", -1, step_count as i64, "");
+        }
         let is_flush_step = next_step_flushes_injection;
         next_step_flushes_injection = false;
         if is_flush_step {
@@ -1219,6 +1253,7 @@ async fn main(input: Input) -> Result<String> {
                     Event::Passthrough(t) => generated.push(t),
                     Event::Call { id, code } => {
                         println!("[ParallelLM] dispatched id={} code={}", id, code);
+                        trace("dispatch", &id, -1, generated.len() as i64, "");
                         pending.push((id, code));
                     }
                     Event::Trap => {
@@ -1251,5 +1286,6 @@ async fn main(input: Input) -> Result<String> {
         }
     }
 
+    trace("run_end", "", t_ms() as i64, generated.len() as i64, "");
     Ok(tokenizer.decode(&generated).unwrap_or_default())
 }

@@ -12,6 +12,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::Instant;
 
@@ -24,6 +25,33 @@ use inferlet::{Constrain, Context, Generator, Result, chat, runtime};
 use serde::Deserialize;
 
 const DEBUG_TRACE: bool = false;
+
+// ── Trace instrumentation ───────────────────────────────────────────────────
+// One machine-readable line per event, each with an absolute elapsed-ms
+// timestamp, so the latency-Gantt tooling (benchmarking/viz_timeline.py,
+// trace_extract.py) can place events on a true wall-clock axis instead of
+// reverse-engineering them from token positions. The existing human-readable
+// [AsyncLM] prints are left untouched. Absent numeric fields are -1.
+//   schema: [TRACE] v=<variant> t=<ms> kind=<k> id=<id> dur=<ms> tok=<n> sub=<s>
+const TRACE_V: &str = "async";
+static TRACE_T0: OnceLock<Instant> = OnceLock::new();
+/// Milliseconds since the first traced event (≈ run start; anchored by the
+/// `run_start` trace emitted right after the registry banner).
+fn t_ms() -> u128 {
+    TRACE_T0.get_or_init(Instant::now).elapsed().as_millis()
+}
+fn trace(kind: &str, id: &str, dur: i64, tok: i64, sub: &str) {
+    println!(
+        "[TRACE] v={} t={} kind={} id={} dur={} tok={} sub={}",
+        TRACE_V,
+        t_ms(),
+        kind,
+        id,
+        dur,
+        tok,
+        sub
+    );
+}
 
 // ============================================================================
 // Input
@@ -1364,6 +1392,13 @@ fn poll_and_collect_ready(
                     p.id,
                     p.dispatched_at.elapsed().as_millis()
                 );
+                trace(
+                    "ready",
+                    &p.id,
+                    p.dispatched_at.elapsed().as_millis() as i64,
+                    -1,
+                    "overlap",
+                );
             }
             interrupts.enqueue(&p.id, &result);
             false
@@ -1376,6 +1411,12 @@ fn frames_to_text_with_log(frames: Vec<String>, log_label: &str) -> String {
     let mut text = String::new();
     for frame in frames {
         println!("[AsyncLM] {}: {}", log_label, frame.trim());
+        let fid = frame
+            .trim()
+            .strip_prefix("[INTR]")
+            .and_then(|s| s.trim().split_whitespace().next())
+            .unwrap_or("");
+        trace("inject", fid, -1, -1, log_label);
         text.push_str(&frame);
     }
     text
@@ -1454,6 +1495,9 @@ async fn run_inner_session(
             return Ok(Restart::Done);
         }
         *step_count += 1;
+        if *step_count % 8 == 0 {
+            trace("decode_step", "", -1, *step_count as i64, "");
+        }
 
         let is_flush_step = next_step_flushes_injection;
         next_step_flushes_injection = false;
@@ -1509,6 +1553,7 @@ async fn run_inner_session(
                     Event::ExitCriticalSection => interrupts.set_critical(false),
                     Event::Call { id, code } => {
                         println!("[AsyncLM] dispatching id={id} code={code}");
+                        trace("dispatch", &id, -1, generated.len() as i64, "");
                         let task = wstd::runtime::spawn(execute_call(id.clone(), code));
                         pending.push(PendingCall {
                             id,
@@ -1551,6 +1596,13 @@ async fn run_inner_session(
                             "[AsyncLM] trap decision: {:?}  wait_t={:.1}ms r_ms={:.1}ms s_ms={:.1}ms n={} in_flight={}",
                             strategy, wait_ms, r_ms, s_ms, n, in_flight
                         );
+                        trace(
+                            "trap_start",
+                            "",
+                            -1,
+                            in_flight as i64,
+                            &format!("{:?}", strategy),
+                        );
 
                         let trap_start = Instant::now();
                         // Block on the remaining in-flight calls. Awaiting the
@@ -1568,12 +1620,20 @@ async fn run_inner_session(
                                 id,
                                 dispatched_at.elapsed().as_millis()
                             );
+                            trace(
+                                "ready",
+                                &id,
+                                dispatched_at.elapsed().as_millis() as i64,
+                                -1,
+                                "trap-await",
+                            );
                             interrupts.enqueue(&id, &result);
                         }
                         println!(
                             "[AsyncLM] trap drained in {}ms",
                             trap_start.elapsed().as_millis()
                         );
+                        trace("trap_end", "", trap_start.elapsed().as_millis() as i64, -1, "");
 
                         interrupts.set_critical(false);
                         match strategy {
@@ -1652,6 +1712,7 @@ async fn main(input: Input) -> Result<String> {
         registry.trap_ids,
         registry.intr_ids
     );
+    trace("run_start", "", -1, -1, "");
 
     // BRLE has to cover the model's FULL logit width — specials (e.g.
     // `<|im_end|>`, `</think>`) often live above the regular BPE vocab.
@@ -1746,6 +1807,7 @@ async fn main(input: Input) -> Result<String> {
                     generated.len(),
                     max_tokens_remaining
                 );
+                trace("checkpoint", &name, -1, generated.len() as i64, "");
             }
             Restart::RestoreAndInject(frames) => {
                 let cp = checkpoint
@@ -1802,5 +1864,6 @@ async fn main(input: Input) -> Result<String> {
         }
     }
 
+    trace("run_end", "", t_ms() as i64, generated.len() as i64, "");
     Ok(tokenizer.decode(&generated).unwrap_or_default())
 }
