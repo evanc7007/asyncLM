@@ -12,6 +12,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::Instant;
 
@@ -24,6 +26,40 @@ use inferlet::{Constrain, Context, Generator, Result, chat, runtime};
 use serde::Deserialize;
 
 const DEBUG_TRACE: bool = false;
+
+// ── Trace instrumentation ───────────────────────────────────────────────────
+// One machine-readable line per event, each with an absolute elapsed-ms
+// timestamp, so the latency-Gantt tooling (benchmarking/viz_timeline.py,
+// trace_extract.py) can place events on a true wall-clock axis instead of
+// reverse-engineering them from token positions. The existing human-readable
+// [AsyncLM] prints are left untouched. Absent numeric fields are -1.
+//   schema: [TRACE] v=<variant> t=<ms> kind=<k> id=<id> dur=<ms> tok=<n> sub=<s>
+const TRACE_V: &str = "async";
+static TRACE_T0: OnceLock<Instant> = OnceLock::new();
+/// Gates the [TRACE] event stream. Off by default; set once in `main` from the
+/// `enable_trace` input. The human-readable [AsyncLM] prints are independent and
+/// always emit.
+static TRACE_ON: AtomicBool = AtomicBool::new(false);
+/// Milliseconds since the first traced event (≈ run start; anchored by the
+/// `run_start` trace emitted right after the registry banner).
+fn t_ms() -> u128 {
+    TRACE_T0.get_or_init(Instant::now).elapsed().as_millis()
+}
+fn trace(kind: &str, id: &str, dur: i64, tok: i64, sub: &str) {
+    if !TRACE_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    println!(
+        "[TRACE] v={} t={} kind={} id={} dur={} tok={} sub={}",
+        TRACE_V,
+        t_ms(),
+        kind,
+        id,
+        dur,
+        tok,
+        sub
+    );
+}
 
 // ============================================================================
 // Input
@@ -46,12 +82,26 @@ struct Input {
     beta_swap_ns_per_tok: f64,
     #[serde(default)]
     enable_midstream: bool,
+    /// Emit the machine-readable [TRACE] event stream (viz_timeline.py / trace_extract.py).
+    #[serde(default)]
+    enable_trace: bool,
+    /// Disable per-call checkpointing and force trap strategy Keep (one unbroken
+    /// generator session). Default true; set false for real checkpoint/restore.
+    #[serde(default = "default_disable_checkpointing")]
+    disable_checkpointing: bool,
+    /// Treat unknown tools in a [CALL] as BFCL latency-emulated calls instead of
+    /// erroring. Needed to run BFCL function names; default false errors.
+    #[serde(default)]
+    emulate_unknown_tools: bool,
     #[serde(default)]
     max_steps: Option<u32>,
 }
 
 fn default_max_tokens() -> usize {
     2048
+}
+fn default_disable_checkpointing() -> bool {
+    true
 }
 fn default_temperature() -> f32 {
     0.6
@@ -105,6 +155,13 @@ fn default_system() -> String {
        frames. Describing a call inside <think> is not the same as making\n\
        the call — you must always emit the literal CML frames outside.\n\
      - Do not fabricate [INTR] frames yourself; the runtime produces them.\n\
+     - NEVER write, repeat, paraphrase, or echo an [INTR] frame or any part\n\
+       of it (the literal [INTR] / [HEAD] / [END] markers, the id, or the\n\
+       JSON value). Each result is already injected into your context — just\n\
+       READ it and answer in prose. The [INTR] lines shown in the examples\n\
+       below are RUNTIME-INJECTED for illustration; they are NOT text you\n\
+       produce. Your own output after a [TRAP][END] is prose only (or the\n\
+       next round's [CALL] frames).\n\
      - Never put plain prose or explanations inside [CALL]; [CALL] bodies must be one of the listed tool functions.\n\
      \n\
      Example 1 — single round, two parallel calls:\n\
@@ -112,28 +169,32 @@ fn default_system() -> String {
      Assistant: [CALL] w1 [HEAD] get_weather(\"New York\") [END]\n\
      [CALL] w2 [HEAD] get_weather(\"London\") [END]\n\
      [TRAP][END]\n\
+     ‹runtime injects the next two lines — you READ them, never write them›\n\
      [INTR] w1 [HEAD] {\"temp_f\": 72, \"sky\": \"sunny\"} [END]\n\
      [INTR] w2 [HEAD] {\"temp_f\": 60, \"sky\": \"cloudy\"} [END]\n\
-     NYC is 72°F and sunny; London is 60°F and cloudy.\n\
+     ‹you resume, prose only› NYC is 72°F and sunny; London is 60°F and cloudy.\n\
      \n\
      Example 2 — two rounds, round 2 depends on round 1 results:\n\
      User: Get the weather in Boston, then also get the weather for a\n\
      city whose name is that temperature (as a string).\n\
      Assistant: [CALL] b1 [HEAD] get_weather(\"Boston\") [END]\n\
      [TRAP][END]\n\
+     ‹runtime injects the next line — you READ it, never write it›\n\
      [INTR] b1 [HEAD] {\"temp_f\": 68, \"sky\": \"clear\"} [END]\n\
-     Boston is 68°F. Now looking up \"68\".\n\
+     ‹you resume, prose only› Boston is 68°F. Now looking up \"68\".\n\
      [CALL] b2 [HEAD] get_weather(\"68\") [END]\n\
      [TRAP][END]\n\
+     ‹runtime injects the next line — you READ it, never write it›\n\
      [INTR] b2 [HEAD] {\"temp_f\": 72, \"sky\": \"sunny\"} [END]\n\
-     Boston is 68°F and clear; \"68\" is 72°F and sunny.\n\
+     ‹you resume, prose only› Boston is 68°F and clear; \"68\" is 72°F and sunny.\n\
      \n\
      Example 3 — mixed tool + knowledge question:\n\
      User: What's the weather in Paris and what is the capital of Japan?\n\
      Assistant: [CALL] p1 [HEAD] get_weather(\"Paris\") [END]\n\
      [TRAP][END]\n\
+     ‹runtime injects the next line — you READ it, never write it›\n\
      [INTR] p1 [HEAD] {\"temp_f\": 59, \"sky\": \"rainy\"} [END]\n\
-     Paris is 59°F and rainy. The capital of Japan is Tokyo.\n\
+     ‹you resume, prose only› Paris is 59°F and rainy. The capital of Japan is Tokyo.\n\
      \n\
      Example 4 — interleaved prose hides call latency (preferred style\n\
      whenever you have anything to say that does not depend on the\n\
@@ -149,9 +210,10 @@ fn default_system() -> String {
      so a Paris afternoon maps to a Tokyo late-night which is bad, but\n\
      a Paris morning maps to a Tokyo afternoon which is ideal.\n\
      [TRAP][END]\n\
+     ‹runtime injects the next two lines — you READ them, never write them›\n\
      [INTR] w1 [HEAD] {\"temp_f\": 62, \"sky\": \"overcast\"} [END]\n\
      [INTR] t1 [HEAD] {\"time\": \"07:30\", \"tz\": \"Asia/Tokyo\"} [END]\n\
-     Paris is 62°F and overcast — comfortable indoor conditions. Tokyo\n\
+     ‹you resume, prose only› Paris is 62°F and overcast — comfortable indoor conditions. Tokyo\n\
      is 07:30, just starting the workday, so this is a good window."
         .to_string()
 }
@@ -899,7 +961,7 @@ fn noop_waker() -> Waker {
 }
 
 /// Resolve one CML call to its live API and return the `[INTR]` payload.
-async fn execute_call(id: String, code: String) -> String {
+async fn execute_call(id: String, code: String, emulate_unknown: bool) -> String {
     let _ = id;
     let lc = code.to_lowercase();
     let result = if lc.contains("get_weather") || lc.contains("weather(") {
@@ -912,10 +974,37 @@ async fn execute_call(id: String, code: String) -> String {
         time_call(&code).await
     } else if lc.contains("wiki_summary") || lc.contains("wikipedia") || lc.contains("wiki(") {
         wiki_call(&code).await
+    } else if emulate_unknown {
+        // Not one of the five live tools -> BFCL latency-emulated call.
+        bfcl_emulated_call(&code).await
     } else {
         Err(format!("unknown tool in call body: {code}"))
     };
     result.unwrap_or_else(|e| format!("{{\"error\": {e:?}}}"))
+}
+
+/// BFCL latency-emulating fallback (paper §6 / arXiv:2412.07017).
+///
+/// BFCL functions (e.g. `spotify.play`, `math.pythagoras`) are not executable
+/// here; the paper assigns each function a 30-500 ms completion time and the
+/// executor just waits, then returns a result. We hash the function name to a
+/// stable latency in that range (reproducible, per-function differentiated),
+/// sleep on the wstd reactor so token decoding overlaps the wait (the core
+/// async-overlap property), and return a canned payload. Correctness is judged
+/// on the emitted `[CALL]` block, never on this result string.
+async fn bfcl_emulated_call(code: &str) -> std::result::Result<String, String> {
+    let name = code.split('(').next().unwrap_or(code).trim();
+    // FNV-1a over the function name -> latency in [30, 500] ms.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in name.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let latency_ms = 30 + (h % 471); // 30..=500
+    wstd::task::sleep(wstd::time::Duration::from_millis(latency_ms)).await;
+    Ok(format!(
+        "{{\"status\": \"ok\", \"function\": {name:?}, \"latency_ms\": {latency_ms}}}"
+    ))
 }
 
 /// GET `url` and return the response body. Non-2xx and transport errors map
@@ -1021,7 +1110,8 @@ async fn stock_call(code: &str) -> std::result::Result<String, String> {
         // stooq rate-limits/blocks and returns an HTML/JS page instead of CSV;
         // rather than emit a garbage "price" (the old code interpolated column
         // 6 of whatever it got, so a JS fragment leaked into price_usd), fall
-        // back to a deterministic emulated quote so we still echo a clean value.
+        // back to a deterministic emulated quote so the benchmark still gets a
+        // clean value to echo.
         None => emulated_price(&ticker),
     };
     Ok(format!(
@@ -1052,7 +1142,8 @@ async fn fetch_stock_price(ticker: &str) -> Option<f64> {
 }
 
 /// Deterministic fallback quote (~$20–$520, stable per ticker) used when the
-/// live feed is unavailable, so stock prompts still get a clean value to echo.
+/// live feed is unavailable. The scorer only checks the model echoes the
+/// fetched number, so a stable emulated value keeps stock prompts scoreable.
 fn emulated_price(ticker: &str) -> f64 {
     let h = ticker
         .bytes()
@@ -1337,6 +1428,13 @@ fn poll_and_collect_ready(
                     p.id,
                     p.dispatched_at.elapsed().as_millis()
                 );
+                trace(
+                    "ready",
+                    &p.id,
+                    p.dispatched_at.elapsed().as_millis() as i64,
+                    -1,
+                    "overlap",
+                );
             }
             interrupts.enqueue(&p.id, &result);
             false
@@ -1349,6 +1447,12 @@ fn frames_to_text_with_log(frames: Vec<String>, log_label: &str) -> String {
     let mut text = String::new();
     for frame in frames {
         println!("[AsyncLM] {}: {}", log_label, frame.trim());
+        let fid = frame
+            .trim()
+            .strip_prefix("[INTR]")
+            .and_then(|s| s.trim().split_whitespace().next())
+            .unwrap_or("");
+        trace("inject", fid, -1, -1, log_label);
         text.push_str(&frame);
     }
     text
@@ -1427,6 +1531,9 @@ async fn run_inner_session(
             return Ok(Restart::Done);
         }
         *step_count += 1;
+        if *step_count % 8 == 0 {
+            trace("decode_step", "", -1, *step_count as i64, "");
+        }
 
         let is_flush_step = next_step_flushes_injection;
         next_step_flushes_injection = false;
@@ -1482,14 +1589,24 @@ async fn run_inner_session(
                     Event::ExitCriticalSection => interrupts.set_critical(false),
                     Event::Call { id, code } => {
                         println!("[AsyncLM] dispatching id={id} code={code}");
-                        let task = wstd::runtime::spawn(execute_call(id.clone(), code));
+                        trace("dispatch", &id, -1, generated.len() as i64, "");
+                        let task =
+                            wstd::runtime::spawn(execute_call(id.clone(), code, input.emulate_unknown_tools));
                         pending.push(PendingCall {
                             id,
                             dispatched_at: Instant::now(),
                             task,
                         });
                         interrupts.set_critical(false);
-                        return Ok(Restart::Checkpoint);
+                        if !input.disable_checkpointing {
+                            // Real AsyncLM: tear the generator down to snapshot a
+                            // checkpoint here, so a later trap can Recompute/restore.
+                            return Ok(Restart::Checkpoint);
+                        }
+                        // DIAGNOSTIC (disable_checkpointing): do NOT snapshot —
+                        // keep decoding in one unbroken session so the
+                        // bottom-of-loop mid-inject check keeps firing while
+                        // calls are in flight.
                     }
                     Event::Trap => {
                         if pending.is_empty() && interrupts.pending_count() == 0 {
@@ -1513,16 +1630,28 @@ async fn run_inner_session(
                             .map(|cp| generated.len().saturating_sub(cp.tokens_generated_at))
                             .unwrap_or_else(|| generator.tokens_generated());
                         let (mut strategy, r_ms, s_ms) = classify_trap(n, wait_ms, cost);
-                        // Force Keep when nothing is genuinely left to wait
-                        // for: every call already completed during overlap, so
-                        // discarding those tokens (Recompute) would throw away
-                        // the win.
-                        if !checkpoint_available || n == 0 || in_flight == 0 {
+                        if input.disable_checkpointing {
+                            // DIAGNOSTIC: trap manager disabled. Always Keep —
+                            // there is no checkpoint to restore from, so Keep is
+                            // the only valid strategy.
+                            strategy = TrapStrategy::Keep;
+                        } else if !checkpoint_available || n == 0 || in_flight == 0 {
+                            // Real AsyncLM: force Keep when nothing is genuinely
+                            // left to wait for — every call already completed
+                            // during overlap, so discarding those tokens
+                            // (Recompute) would throw away the win.
                             strategy = TrapStrategy::Keep;
                         }
                         println!(
                             "[AsyncLM] trap decision: {:?}  wait_t={:.1}ms r_ms={:.1}ms s_ms={:.1}ms n={} in_flight={}",
                             strategy, wait_ms, r_ms, s_ms, n, in_flight
+                        );
+                        trace(
+                            "trap_start",
+                            "",
+                            -1,
+                            in_flight as i64,
+                            &format!("{:?}", strategy),
                         );
 
                         let trap_start = Instant::now();
@@ -1541,12 +1670,20 @@ async fn run_inner_session(
                                 id,
                                 dispatched_at.elapsed().as_millis()
                             );
+                            trace(
+                                "ready",
+                                &id,
+                                dispatched_at.elapsed().as_millis() as i64,
+                                -1,
+                                "trap-await",
+                            );
                             interrupts.enqueue(&id, &result);
                         }
                         println!(
                             "[AsyncLM] trap drained in {}ms",
                             trap_start.elapsed().as_millis()
                         );
+                        trace("trap_end", "", trap_start.elapsed().as_millis() as i64, -1, "");
 
                         interrupts.set_critical(false);
                         match strategy {
@@ -1625,6 +1762,13 @@ async fn main(input: Input) -> Result<String> {
         registry.trap_ids,
         registry.intr_ids
     );
+    TRACE_ON.store(input.enable_trace, Ordering::Relaxed);
+    trace("run_start", "", -1, -1, "");
+    if input.disable_checkpointing {
+        println!(
+            "[AsyncLM] DIAGNOSTIC: trap-manager disabled (always Keep), checkpointing disabled — one unbroken generator session"
+        );
+    }
 
     // BRLE has to cover the model's FULL logit width — specials (e.g.
     // `<|im_end|>`, `</think>`) often live above the regular BPE vocab.
@@ -1719,6 +1863,7 @@ async fn main(input: Input) -> Result<String> {
                     generated.len(),
                     max_tokens_remaining
                 );
+                trace("checkpoint", &name, -1, generated.len() as i64, "");
             }
             Restart::RestoreAndInject(frames) => {
                 let cp = checkpoint
@@ -1775,5 +1920,6 @@ async fn main(input: Input) -> Result<String> {
         }
     }
 
+    trace("run_end", "", t_ms() as i64, generated.len() as i64, "");
     Ok(tokenizer.decode(&generated).unwrap_or_default())
 }

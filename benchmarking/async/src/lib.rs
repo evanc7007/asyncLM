@@ -1573,7 +1573,10 @@ async fn run_inner_session(
                             task,
                         });
                         interrupts.set_critical(false);
-                        return Ok(Restart::Checkpoint);
+                        // DIAGNOSTIC: checkpointing disabled. Do NOT tear the
+                        // generator down to snapshot here — keep decoding in one
+                        // unbroken session so the bottom-of-loop mid-inject check
+                        // keeps firing while calls are in flight.
                     }
                     Event::Trap => {
                         if pending.is_empty() && interrupts.pending_count() == 0 {
@@ -1596,14 +1599,13 @@ async fn run_inner_session(
                             .as_ref()
                             .map(|cp| generated.len().saturating_sub(cp.tokens_generated_at))
                             .unwrap_or_else(|| generator.tokens_generated());
-                        let (mut strategy, r_ms, s_ms) = classify_trap(n, wait_ms, cost);
-                        // Force Keep when nothing is genuinely left to wait
-                        // for: every call already completed during overlap, so
-                        // discarding those tokens (Recompute) would throw away
-                        // the win.
-                        if !checkpoint_available || n == 0 || in_flight == 0 {
-                            strategy = TrapStrategy::Keep;
-                        }
+                        let (_classified, r_ms, s_ms) = classify_trap(n, wait_ms, cost);
+                        // DIAGNOSTIC: trap manager disabled. Always Keep —
+                        // ignore the classifier and never Recompute/Swap. There
+                        // is no checkpoint to restore from in this build, so
+                        // Keep is the only valid strategy.
+                        let _ = checkpoint_available;
+                        let strategy = TrapStrategy::Keep;
                         println!(
                             "[AsyncLM] trap decision: {:?}  wait_t={:.1}ms r_ms={:.1}ms s_ms={:.1}ms n={} in_flight={}",
                             strategy, wait_ms, r_ms, s_ms, n, in_flight
@@ -1725,6 +1727,9 @@ async fn main(input: Input) -> Result<String> {
         registry.intr_ids
     );
     trace("run_start", "", -1, -1, "");
+    println!(
+        "[AsyncLM] DIAGNOSTIC BUILD: trap-manager disabled (always Keep), checkpointing disabled — one unbroken generator session"
+    );
 
     // BRLE has to cover the model's FULL logit width — specials (e.g.
     // `<|im_end|>`, `</think>`) often live above the regular BPE vocab.
