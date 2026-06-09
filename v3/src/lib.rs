@@ -1,13 +1,45 @@
-//! AsyncLM v3 inferlet — v2's robust CML parser/runtime plus the paper §5
-//! mechanisms that the current Pie SDK can represent.
+//! AsyncLM — asynchronous LLM function calling.
 //!
-//! v3 adds critical-section tracking, an interrupt queue with optional
-//! safe-boundary mid-stream injection, a Keep/Recompute/Swap trap classifier,
-//! and `[CALL]` checkpoints. Recompute is implemented by dropping the active
-//! `Generator`, restoring the saved `Context` snapshot, and injecting the
-//! completed `[INTR]` frames before sampling resumes. Swap is still classified
-//! and logged, but Pie exposes no separate RAM-tier KV primitive, so Swap
-//! execution collapses to Keep.
+//! An inferlet implementation of AsyncLM (In Gim, Seung-seob Lee, Lin Zhong,
+//! "Asynchronous LLM Function Calling," arXiv:2412.07017). The model dispatches
+//! tool calls *without blocking* and keeps generating, so function-call latency
+//! overlaps token decoding instead of stalling it; the paper reports 1.6×–5.4×
+//! lower end-to-end task latency versus synchronous calling on BFCL.
+//!
+//! The model and runtime communicate through the paper's CML (Context Markup
+//! Language) token protocol:
+//!
+//! - `[CALL] <id> [HEAD] <code> [END]` — dispatch a call (non-blocking); the
+//!   model emits this and immediately continues generating.
+//! - `[TRAP][END]` — pause generation until every dispatched call has returned.
+//! - `[INTR] <id> [HEAD] <value> [END]` — a result frame the *runtime* injects;
+//!   the model only ever reads these, never writes them.
+//!
+//! The inferlet drives the entire loop. It scans the model's token stream for
+//! CML delimiters with a small FSM parser (`Parser`), fires each `[CALL]` as a
+//! real HTTP request on the `wstd` reactor so it runs concurrently with
+//! decoding, and injects each `[INTR]` result back into the live `Generator`.
+//! Five live tools are wired up: weather, stock price, currency, time, and
+//! Wikipedia summaries.
+//!
+//! It also implements the paper's trap-time scheduling: a critical-section
+//! tracker so results are only injected at safe parser boundaries, optional
+//! mid-stream injection (deliver a result *while* the model is still writing
+//! result-independent prose, before the trap), and a Keep / Recompute / Swap
+//! classifier backed by checkpoints taken at each `[CALL]`. Recompute restores a
+//! saved `Context` snapshot and replays the completed `[INTR]` frames before
+//! sampling resumes. Swap is classified and logged, but Pie exposes no separate
+//! RAM-tier KV primitive, so Swap execution collapses to Keep.
+//!
+//! Pie features exercised:
+//!   - `Context` chat-template helpers (`system`, `user`, `cue`) and
+//!     `Context::{snapshot, open, delete}` for checkpoint / restore.
+//!   - Token-level generation: stepping a `Generator` with `next` / `execute`,
+//!     `accept`-ing runtime-injected tokens, and `clear_sampler` to flush an
+//!     injected frame into the next decode step.
+//!   - `Constrain` with a precomputed BRLE mask that bans the token ids unique
+//!     to `[INTR]`, so the model can never forge a result frame.
+//!   - `wstd` async tasks + HTTP client, so real tool calls overlap decoding.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -21,18 +53,25 @@ use inferlet::model::{Model, Tokenizer};
 use inferlet::sample::Sampler;
 use inferlet::serde_json::Value;
 use inferlet::wstd;
+use inferlet::wstd::future::FutureExt;
 use inferlet::wstd::http::{Client, Method, Request};
 use inferlet::{Constrain, Context, Generator, Result, chat, runtime};
 use serde::Deserialize;
 
-const DEBUG_TRACE: bool = false;
+/// Gates the verbose per-token `[dbg]` diagnostics. Off by default; set in
+/// `main` from the `enable_token_trace` input.
+static TOKEN_TRACE_ON: AtomicBool = AtomicBool::new(false);
+fn token_trace_on() -> bool {
+    TOKEN_TRACE_ON.load(Ordering::Relaxed)
+}
 
 // ── Trace instrumentation ───────────────────────────────────────────────────
-// One machine-readable line per event, each with an absolute elapsed-ms
-// timestamp, so the latency-Gantt tooling (benchmarking/viz_timeline.py,
-// trace_extract.py) can place events on a true wall-clock axis instead of
-// reverse-engineering them from token positions. The existing human-readable
-// [AsyncLM] prints are left untouched. Absent numeric fields are -1.
+// Optional machine-readable event stream, gated by `enable_trace`. One line
+// per event, each with an absolute elapsed-ms timestamp, so an offline tool can
+// place dispatch / trap / inject events on a true wall-clock axis for latency
+// analysis instead of reverse-engineering them from token positions. The
+// human-readable [AsyncLM] prints are independent and always on. Absent numeric
+// fields are -1.
 //   schema: [TRACE] v=<variant> t=<ms> kind=<k> id=<id> dur=<ms> tok=<n> sub=<s>
 const TRACE_V: &str = "async";
 static TRACE_T0: OnceLock<Instant> = OnceLock::new();
@@ -80,11 +119,16 @@ struct Input {
     alpha_recompute_ns_per_tok2: f64,
     #[serde(default = "default_beta")]
     beta_swap_ns_per_tok: f64,
+    /// Enable safe-boundary mid-stream [INTR] injection (the paper's in-flight
+    /// interrupt mechanism: deliver a result before the model reaches `[TRAP]`).
     #[serde(default)]
     enable_midstream: bool,
-    /// Emit the machine-readable [TRACE] event stream (viz_timeline.py / trace_extract.py).
+    /// Emit the machine-readable [TRACE] event stream for offline latency analysis.
     #[serde(default)]
     enable_trace: bool,
+    /// Emit verbose per-token `[dbg]` decode/injection diagnostics.
+    #[serde(default)]
+    enable_token_trace: bool,
     /// Disable per-call checkpointing and force trap strategy Keep (one unbroken
     /// generator session). Default true; set false for real checkpoint/restore.
     #[serde(default = "default_disable_checkpointing")]
@@ -370,7 +414,7 @@ fn compute_intr_suppression(
 // ============================================================================
 // Constraint — block the [INTR]-unique token ids
 //
-// The new SDK has no custom-sampler hook. INTR suppression goes through the
+// Pie has no custom-sampler hook. INTR suppression goes through the
 // constraint mask path: emit a BRLE that allows every vocab id except those
 // in `suppressed`. The ban list is static, so we compute the mask once and
 // hand back the same slice every step.
@@ -505,7 +549,7 @@ impl Parser {
     }
 
     /// True iff Normal state with no pending delimiter prefix — a safe
-    /// boundary for §5.3 mid-stream interrupt injection.
+    /// boundary for mid-stream interrupt injection.
     fn is_clean(&self) -> bool {
         self.state == State::Normal && self.buf.is_empty()
     }
@@ -961,8 +1005,7 @@ fn noop_waker() -> Waker {
 }
 
 /// Resolve one CML call to its live API and return the `[INTR]` payload.
-async fn execute_call(id: String, code: String, emulate_unknown: bool) -> String {
-    let _ = id;
+async fn execute_call(code: String, emulate_unknown: bool) -> String {
     let lc = code.to_lowercase();
     let result = if lc.contains("get_weather") || lc.contains("weather(") {
         weather_call(&code).await
@@ -983,15 +1026,16 @@ async fn execute_call(id: String, code: String, emulate_unknown: bool) -> String
     result.unwrap_or_else(|e| format!("{{\"error\": {e:?}}}"))
 }
 
-/// BFCL latency-emulating fallback (paper §6 / arXiv:2412.07017).
+/// Latency-emulating fallback for non-live tools (gated by `emulate_unknown_tools`).
 ///
-/// BFCL functions (e.g. `spotify.play`, `math.pythagoras`) are not executable
-/// here; the paper assigns each function a 30-500 ms completion time and the
-/// executor just waits, then returns a result. We hash the function name to a
-/// stable latency in that range (reproducible, per-function differentiated),
-/// sleep on the wstd reactor so token decoding overlaps the wait (the core
-/// async-overlap property), and return a canned payload. Correctness is judged
-/// on the emitted `[CALL]` block, never on this result string.
+/// Berkeley Function-Calling Leaderboard (BFCL) functions (e.g. `spotify.play`,
+/// `math.pythagoras`) are not executable here. Following the AsyncLM paper's
+/// evaluation setup, we assign each function a 30-500 ms completion time and
+/// just wait, then return a result: hash the function name to a stable latency
+/// in that range (reproducible, per-function differentiated), sleep on the wstd
+/// reactor so token decoding overlaps the wait (the core async-overlap
+/// property), and return a canned payload. Correctness is judged on the emitted
+/// `[CALL]` block, never on this result string.
 async fn bfcl_emulated_call(code: &str) -> std::result::Result<String, String> {
     let name = code.split('(').next().unwrap_or(code).trim();
     // FNV-1a over the function name -> latency in [30, 500] ms.
@@ -1007,9 +1051,14 @@ async fn bfcl_emulated_call(code: &str) -> std::result::Result<String, String> {
     ))
 }
 
+/// Per-request HTTP timeout. Tool calls run on the wstd reactor and are
+/// awaited at the trap, so without a bound a hung upstream would block the
+/// whole trap; on timeout the call folds into an `{"error": ...}` frame.
+const HTTP_TIMEOUT_SECS: u64 = 10;
+
 /// GET `url` and return the response body. Non-2xx and transport errors map
 /// to `Err`. A User-Agent is set because Wikipedia (and OSM) reject requests
-/// without one.
+/// without one. Both awaits are bounded by `HTTP_TIMEOUT_SECS`.
 async fn http_get(url: &str) -> std::result::Result<String, String> {
     let client = Client::new();
     let req = Request::builder()
@@ -1020,13 +1069,17 @@ async fn http_get(url: &str) -> std::result::Result<String, String> {
         .map_err(|e| format!("build request {url}: {e}"))?;
     let resp = client
         .send(req)
+        .timeout(wstd::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
         .await
+        .map_err(|_| format!("timeout sending {url}"))?
         .map_err(|e| format!("send {url}: {e}"))?;
     let status = resp.status().as_u16();
     let mut body = resp.into_body();
     let bytes = body
         .bytes()
+        .timeout(wstd::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
         .await
+        .map_err(|_| format!("timeout reading body {url}"))?
         .map_err(|e| format!("read body {url}: {e}"))?;
     let text = String::from_utf8_lossy(&bytes).into_owned();
     if !(200..300).contains(&status) {
@@ -1034,6 +1087,13 @@ async fn http_get(url: &str) -> std::result::Result<String, String> {
         return Err(format!("HTTP {status} from {url}: {snip}"));
     }
     Ok(text)
+}
+
+/// GET `url` and parse the body as JSON. `tool` prefixes the error message so
+/// the failing call is identifiable in the `{"error": ...}` payload.
+async fn fetch_json(url: &str, tool: &str) -> std::result::Result<Value, String> {
+    let body = http_get(url).await?;
+    inferlet::serde_json::from_str(&body).map_err(|e| format!("{tool}: bad JSON: {e}"))
 }
 
 /// Percent-encode a path/query component (RFC 3986 unreserved set kept).
@@ -1083,14 +1143,16 @@ fn between(s: &str, delim: char) -> Option<String> {
 async fn weather_call(code: &str) -> std::result::Result<String, String> {
     let city = first_arg(code).ok_or("get_weather: missing city")?;
     let url = format!("https://wttr.in/{}?format=j1", urlencode(&city));
-    let body = http_get(&url).await?;
-    let v: Value =
-        inferlet::serde_json::from_str(&body).map_err(|e| format!("get_weather: bad JSON: {e}"))?;
+    let v = fetch_json(&url, "get_weather").await?;
     let cur = v
         .get("current_condition")
         .and_then(|c| c.get(0))
         .ok_or("get_weather: no current_condition")?;
-    let temp_f = cur.get("temp_F").and_then(Value::as_str).unwrap_or("0");
+    let temp_f = cur
+        .get("temp_F")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
     let sky = cur
         .get("weatherDesc")
         .and_then(|d| d.get(0))
@@ -1107,11 +1169,10 @@ async fn stock_call(code: &str) -> std::result::Result<String, String> {
     let ticker = first_arg(code).ok_or("get_stock_price: missing ticker")?;
     let price = match fetch_stock_price(&ticker).await {
         Some(p) => p,
-        // stooq rate-limits/blocks and returns an HTML/JS page instead of CSV;
-        // rather than emit a garbage "price" (the old code interpolated column
-        // 6 of whatever it got, so a JS fragment leaked into price_usd), fall
-        // back to a deterministic emulated quote so the benchmark still gets a
-        // clean value to echo.
+        // stooq rate-limits/blocks and can return an HTML/JS page instead of
+        // CSV. `fetch_stock_price` returns `Some` only for a clean numeric
+        // quote, so on any junk response fall back to a deterministic emulated
+        // price rather than leak a parsed-garbage value into the result frame.
         None => emulated_price(&ticker),
     };
     Ok(format!(
@@ -1160,9 +1221,7 @@ async fn currency_call(code: &str) -> std::result::Result<String, String> {
         _ => ("USD".to_string(), "EUR".to_string()),
     };
     let url = format!("https://api.frankfurter.dev/v1/latest?from={from}&to={to}");
-    let body = http_get(&url).await?;
-    let v: Value = inferlet::serde_json::from_str(&body)
-        .map_err(|e| format!("convert_currency: bad JSON: {e}"))?;
+    let v = fetch_json(&url, "convert_currency").await?;
     let rate = v
         .get("rates")
         .and_then(|r| r.get(&to))
@@ -1187,9 +1246,7 @@ async fn time_call(code: &str) -> std::result::Result<String, String> {
         "https://timeapi.io/api/Time/current/zone?timeZone={}",
         urlencode(&tz)
     );
-    let body = http_get(&url).await?;
-    let v: Value =
-        inferlet::serde_json::from_str(&body).map_err(|e| format!("get_time: bad JSON: {e}"))?;
+    let v = fetch_json(&url, "get_time").await?;
     let time = v.get("time").and_then(Value::as_str).unwrap_or("?");
     let day = v.get("dayOfWeek").and_then(Value::as_str).unwrap_or("?");
     Ok(format!(
@@ -1229,9 +1286,7 @@ async fn wiki_call(code: &str) -> std::result::Result<String, String> {
         "https://en.wikipedia.org/api/rest_v1/page/summary/{}",
         urlencode(&title.replace(' ', "_"))
     );
-    let body = http_get(&url).await?;
-    let v: Value =
-        inferlet::serde_json::from_str(&body).map_err(|e| format!("wiki_summary: bad JSON: {e}"))?;
+    let v = fetch_json(&url, "wiki_summary").await?;
     let extract = v.get("extract").and_then(Value::as_str).unwrap_or("");
     if extract.is_empty() {
         return Err(format!("wiki_summary: no summary for {title:?}"));
@@ -1470,7 +1525,7 @@ fn stage_injection(
         return;
     }
 
-    if DEBUG_TRACE {
+    if token_trace_on() {
         println!("[dbg] accept injecting {} tokens", injected.len());
     }
 
@@ -1478,7 +1533,7 @@ fn stage_injection(
         let tail = *injected.last().unwrap();
         let prefix_len = injected.len() - 1;
         let accepted = generator.accept(&injected[..prefix_len]);
-        if DEBUG_TRACE {
+        if token_trace_on() {
             println!(
                 "[dbg] accepted injected prefix {} tokens; deferring final token",
                 accepted.len()
@@ -1491,6 +1546,27 @@ fn stage_injection(
     } else {
         let _ = generator.accept(&injected);
     }
+}
+
+/// Log + build the injection text from `frames`, then stage it into the live
+/// `generator`. Wraps `frames_to_text_with_log` + `stage_injection` — the
+/// pairing used at every injection site (pending / keep / mid).
+fn inject_frames(
+    generator: &mut Generator<'_>,
+    tokenizer: &Tokenizer,
+    frames: Vec<String>,
+    log_label: &str,
+    next_step_flushes_injection: &mut bool,
+    deferred_injected_tail: &mut Option<u32>,
+) {
+    let text = frames_to_text_with_log(frames, log_label);
+    stage_injection(
+        generator,
+        tokenizer,
+        &text,
+        next_step_flushes_injection,
+        deferred_injected_tail,
+    );
 }
 
 async fn run_inner_session(
@@ -1511,11 +1587,11 @@ async fn run_inner_session(
     let mut deferred_injected_tail: Option<u32> = None;
 
     if let Some(injection) = pending_inject.take() {
-        let text = frames_to_text_with_log(injection.frames, injection.log_label);
-        stage_injection(
+        inject_frames(
             generator,
             tokenizer,
-            &text,
+            injection.frames,
+            injection.log_label,
             &mut next_step_flushes_injection,
             &mut deferred_injected_tail,
         );
@@ -1543,7 +1619,7 @@ async fn run_inner_session(
 
         let out = step.execute().await?;
 
-        if DEBUG_TRACE {
+        if token_trace_on() {
             let dbg_tokens: Vec<String> = out
                 .tokens
                 .iter()
@@ -1560,7 +1636,7 @@ async fn run_inner_session(
 
         if is_flush_step {
             if let Some(tail) = deferred_injected_tail.take() {
-                if DEBUG_TRACE {
+                if token_trace_on() {
                     println!(
                         "[dbg] staged final injected token {}={:?} for sampled resume",
                         tail,
@@ -1581,6 +1657,10 @@ async fn run_inner_session(
         }
         poll_and_collect_ready(pending, interrupts, true);
 
+        // Defer any checkpoint restart until the whole `out.tokens` batch is
+        // processed (see the `Event::Call` arm), so we never drop trailing
+        // tokens/events from this decode step mid-iteration.
+        let mut want_checkpoint = false;
         for &tok in &out.tokens {
             for event in parser.feed(tok, tokenizer) {
                 match event {
@@ -1590,8 +1670,10 @@ async fn run_inner_session(
                     Event::Call { id, code } => {
                         println!("[AsyncLM] dispatching id={id} code={code}");
                         trace("dispatch", &id, -1, generated.len() as i64, "");
-                        let task =
-                            wstd::runtime::spawn(execute_call(id.clone(), code, input.emulate_unknown_tools));
+                        let task = wstd::runtime::spawn(execute_call(
+                            code,
+                            input.emulate_unknown_tools,
+                        ));
                         pending.push(PendingCall {
                             id,
                             dispatched_at: Instant::now(),
@@ -1599,14 +1681,17 @@ async fn run_inner_session(
                         });
                         interrupts.set_critical(false);
                         if !input.disable_checkpointing {
-                            // Real AsyncLM: tear the generator down to snapshot a
-                            // checkpoint here, so a later trap can Recompute/restore.
-                            return Ok(Restart::Checkpoint);
+                            // Paper-faithful path: snapshot a checkpoint so a
+                            // later trap can Recompute by restoring it. Flag it
+                            // here and tear the generator down only after the
+                            // current step is fully drained (below), rather than
+                            // returning mid-batch and dropping trailing tokens.
+                            want_checkpoint = true;
                         }
-                        // DIAGNOSTIC (disable_checkpointing): do NOT snapshot —
-                        // keep decoding in one unbroken session so the
-                        // bottom-of-loop mid-inject check keeps firing while
-                        // calls are in flight.
+                        // Default path (`disable_checkpointing`): do NOT
+                        // snapshot — keep decoding in one unbroken session so the
+                        // bottom-of-loop mid-stream injection keeps firing while
+                        // calls are in flight (no snapshot churn, maximal overlap).
                     }
                     Event::Trap => {
                         if pending.is_empty() && interrupts.pending_count() == 0 {
@@ -1631,15 +1716,14 @@ async fn run_inner_session(
                             .unwrap_or_else(|| generator.tokens_generated());
                         let (mut strategy, r_ms, s_ms) = classify_trap(n, wait_ms, cost);
                         if input.disable_checkpointing {
-                            // DIAGNOSTIC: trap manager disabled. Always Keep —
-                            // there is no checkpoint to restore from, so Keep is
+                            // Default path: no checkpoint was taken, so Keep is
                             // the only valid strategy.
                             strategy = TrapStrategy::Keep;
                         } else if !checkpoint_available || n == 0 || in_flight == 0 {
-                            // Real AsyncLM: force Keep when nothing is genuinely
-                            // left to wait for — every call already completed
-                            // during overlap, so discarding those tokens
-                            // (Recompute) would throw away the win.
+                            // Force Keep when nothing is genuinely left to wait
+                            // for — every call already completed during overlap,
+                            // so discarding those tokens (Recompute) would throw
+                            // away the win.
                             strategy = TrapStrategy::Keep;
                         }
                         println!(
@@ -1687,33 +1771,25 @@ async fn run_inner_session(
 
                         interrupts.set_critical(false);
                         match strategy {
-                            TrapStrategy::Keep => {
-                                let text =
-                                    frames_to_text_with_log(interrupts.drain(), "keep-inject");
-                                stage_injection(
-                                    generator,
-                                    tokenizer,
-                                    &text,
-                                    &mut next_step_flushes_injection,
-                                    &mut deferred_injected_tail,
-                                );
-                            }
-                            TrapStrategy::Swap => {
-                                println!(
-                                    "[AsyncLM] swap collapsing to Keep — SDK has no RAM-tier primitive"
-                                );
-                                let text =
-                                    frames_to_text_with_log(interrupts.drain(), "keep-inject");
-                                stage_injection(
-                                    generator,
-                                    tokenizer,
-                                    &text,
-                                    &mut next_step_flushes_injection,
-                                    &mut deferred_injected_tail,
-                                );
-                            }
                             TrapStrategy::Recompute => {
                                 return Ok(Restart::RestoreAndInject(interrupts.drain()));
+                            }
+                            // Swap has no separate RAM-tier primitive in Pie, so it
+                            // executes as Keep (logged); both inject the drained frames.
+                            TrapStrategy::Keep | TrapStrategy::Swap => {
+                                if strategy == TrapStrategy::Swap {
+                                    println!(
+                                        "[AsyncLM] swap collapsing to Keep — SDK has no RAM-tier primitive"
+                                    );
+                                }
+                                inject_frames(
+                                    generator,
+                                    tokenizer,
+                                    interrupts.drain(),
+                                    "keep-inject",
+                                    &mut next_step_flushes_injection,
+                                    &mut deferred_injected_tail,
+                                );
                             }
                         }
                     }
@@ -1721,12 +1797,18 @@ async fn run_inner_session(
             }
         }
 
+        if want_checkpoint {
+            // Whole step drained; now tear the generator down so the outer
+            // loop snapshots a clean checkpoint and restarts (see `Restart`).
+            return Ok(Restart::Checkpoint);
+        }
+
         if input.enable_midstream && !interrupts.in_critical_section && parser.is_clean() {
-            let text = frames_to_text_with_log(interrupts.drain(), "mid-inject");
-            stage_injection(
+            inject_frames(
                 generator,
                 tokenizer,
-                &text,
+                interrupts.drain(),
+                "mid-inject",
                 &mut next_step_flushes_injection,
                 &mut deferred_injected_tail,
             );
@@ -1763,6 +1845,7 @@ async fn main(input: Input) -> Result<String> {
         registry.intr_ids
     );
     TRACE_ON.store(input.enable_trace, Ordering::Relaxed);
+    TOKEN_TRACE_ON.store(input.enable_token_trace, Ordering::Relaxed);
     trace("run_start", "", -1, -1, "");
     if input.disable_checkpointing {
         println!(
@@ -1905,7 +1988,7 @@ async fn main(input: Input) -> Result<String> {
         }
     }
 
-    if DEBUG_TRACE {
+    if token_trace_on() {
         println!(
             "[dbg] loop exited after {} steps; generated.len={}; pending.len={}",
             step_count,
